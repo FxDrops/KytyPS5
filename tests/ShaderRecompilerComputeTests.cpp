@@ -7311,8 +7311,11 @@ public:
       constexpr uint64_t fresh_copy_source = 0x1b40000;
       constexpr uint32_t fresh_write_value = 0xabcdef01u;
       std::memcpy(memory + fresh_copy_source, &fresh_write_value, 4);
-      for (uint32_t method = 0; method < 2; ++method) {
-        const auto address = base + 0x1b20000 + method * 0x10000;
+      constexpr std::array<uint64_t, 3> fresh_destination_offsets{
+          0x1b20000, 0x1b30000, 0x1b50000};
+      for (uint32_t method = 0; method < fresh_destination_offsets.size();
+           ++method) {
+        const auto address = base + fresh_destination_offsets[method];
         auto desc = MakeLinearDesc(
             address, 16, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
             Prospero::ImageType::kColor2D, {2, 2, 1}, 1, 4, 1);
@@ -7330,18 +7333,28 @@ public:
         if (method == 0) {
           resources.GetBufferCache().FillBuffer(address + 4, 4,
                                                 fresh_write_value, false);
-        } else {
+        } else if (method == 1) {
           resources.GetBufferCache().CopyBuffer(
               address + 4, base + fresh_copy_source, 4, false, false);
+        } else {
+          resources.GetBufferCache().CopyBuffer(
+              address + 3, base + fresh_copy_source + 1, 3, false, false);
         }
         (void)texture_cache.FindTexture(id, desc);
+        std::vector<u32> expected(4, 0x76543210u);
+        if (method == 2) {
+          std::memcpy(reinterpret_cast<uint8_t *>(expected.data()) + 3,
+                      reinterpret_cast<const uint8_t *>(&fresh_write_value) + 1,
+                      3);
+        } else {
+          expected[1] = fresh_write_value;
+        }
         Require(
             name,
-            method == 0 ? "fill into fresh native image"
-                        : "copy into fresh native image",
-            ReadCachedTexel(name, context, id, {}, {2, 2, 1}) ==
-                std::vector<u32>{0x76543210u, fresh_write_value, 0x76543210u,
-                                 0x76543210u},
+            method == 0   ? "fill into fresh native image"
+            : method == 1 ? "copy into fresh native image"
+                          : "byte copy across native texel boundary",
+            ReadCachedTexel(name, context, id, {}, {2, 2, 1}) == expected,
             "partial write through CPU fast path lost untouched GPU texels");
       }
 
