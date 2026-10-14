@@ -759,12 +759,35 @@ bool TextureCache::PublishImageToBuffer(Image& image) {
 	if (!CanDownload(image)) {
 		return false;
 	}
+	ImageIds aliases;
+	if (!image.depth_id && !image.info.HasStencil() && !image.info.HasMetadata()) {
+		for (const auto candidate:
+		     FindImagesInRegion(image.info.data.address, image.info.data.size, false)) {
+			auto& alias = m_slot_images[candidate];
+			if (&alias == &image || alias.depth_id || alias.info.HasStencil() ||
+			    alias.info.HasMetadata() || alias.info.pitch != image.info.pitch ||
+			    alias.info.mip_layout != image.info.mip_layout ||
+			    !SameBacking(alias.info, image.info, false) ||
+			    !SameBacking(image.info, alias.info, false)) {
+				continue;
+			}
+			if (alias.SafeToDownload()) {
+				EXIT("TextureCache: conflicting native writers during alias publication\n");
+			}
+			aliases.push_back(candidate);
+		}
+	}
 	// Preserve guest padding before overlaying the native GPU image contents.
 	auto [buffer, offset] =
 	    m_buffer_cache.ObtainBuffer(image.info.data.address, image.info.data.size, true);
 	DownloadImage(image, *buffer, offset, image.info.data.size, image.info.resources.levels);
 	image.ClearGpuModified();
 	image.MarkBufferModified();
+	// Publication supersedes every matching copy, regardless of which lookup
+	// triggered it. Unused aliases must not retain their earlier native contents.
+	for (const auto alias: aliases) {
+		m_slot_images[alias].MarkBufferModified();
+	}
 	return true;
 }
 
@@ -1176,7 +1199,6 @@ void TextureCache::RefreshImage(ImageId id) {
 		(void)image.ResolveMaybeCpuHash(image.HashGuestEdges());
 	}
 	if (!image.depth_id && !image.info.HasStencil() && !image.info.HasMetadata()) {
-		ImageIds aliases;
 		ImageId  writer {};
 		for (const auto candidate:
 		     FindImagesInRegion(image.info.data.address, image.info.data.size, false)) {
@@ -1188,7 +1210,6 @@ void TextureCache::RefreshImage(ImageId id) {
 			    !SameBacking(image.info, alias.info, false)) {
 				continue;
 			}
-			aliases.push_back(candidate);
 			if (alias.SafeToDownload()) {
 				if (writer || image.SafeToDownload()) {
 					EXIT("TextureCache: conflicting native writers for equal-layout aliases\n");
@@ -1199,11 +1220,6 @@ void TextureCache::RefreshImage(ImageId id) {
 		if (writer) {
 			if (!PublishImageToBuffer(m_slot_images[writer])) {
 				EXIT("TextureCache: cannot publish existing format alias contents\n");
-			}
-			// All matching native copies must reload, even aliases not used by this draw.
-			image.MarkBufferModified();
-			for (const auto alias: aliases) {
-				m_slot_images[alias].MarkBufferModified();
 			}
 		}
 	}
