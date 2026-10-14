@@ -831,7 +831,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		    requested.IsDepth() && (requested.HasStencil() || cached.info.HasStencil() ||
 			                        requested.HasMetadata() || cached.info.HasMetadata());
 		if (!depth_has_auxiliary_planes && reshaped_subresources &&
-		    requested.pixel_format == cached.info.pixel_format &&
+		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format) &&
 		    requested.type == cached.info.type && requested.tile_mode == cached.info.tile_mode) {
 			// Mixed mip/layer growth can change the guest stride. Preserve byte
 			// ownership instead of copying identically numbered native subresources.

@@ -8686,6 +8686,55 @@ public:
               ReadBuffer(name, reverse_readback, 10) == reverse_expected,
               "reverse reshape lost updated GPU pixels or retained mip bytes");
       DestroyBuffer(&reverse_readback);
+      reverse_native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                             vk::AccessFlagBits2::eTransferWrite, {},
+                             command.Handle());
+      capacity_clear.float32[0] = 0.625f;
+      command.Handle().clearColorImage(reverse_native.backing.image,
+                                       vk::ImageLayout::eTransferDstOptimal,
+                                       capacity_clear, capacity_range);
+      texture_cache.MarkGpuWritten(reverse_id);
+      ForEachCapacityWord(
+          reverse_request.info,
+          [&](uint64_t word, uint32_t, uint32_t, uint32_t, uint32_t) {
+            color_capacity_guest[word] = std::bit_cast<u32>(0.625f);
+          });
+      auto mixed_format_request = color_capacity_request;
+      mixed_format_request.info.pixel_format = vk::Format::eR32Uint;
+      mixed_format_request.info.guest_format = Prospero::BufferFormat::k32UInt;
+      mixed_format_request.view_info.format = vk::Format::eR32Uint;
+      mixed_format_request.info.UpdateSize();
+      const auto mixed_format_id =
+          texture_cache.FindImage(mixed_format_request);
+      auto &mixed_format_native = texture_cache.GetImage(mixed_format_id);
+      Require(name, "mixed-format reshape capacity",
+              mixed_format_id != reverse_id &&
+                  mixed_format_native.backing.layers == 4 &&
+                  mixed_format_native.backing.mip_levels == 1,
+              "compatible-format alias reused a backing with too few layers");
+      (void)texture_cache.FindTexture(mixed_format_id, mixed_format_request);
+      std::vector<u32> mixed_format_expected(16);
+      ForEachCapacityWord(
+          mixed_format_request.info,
+          [&](uint64_t word, uint32_t, uint32_t layer, uint32_t y, uint32_t x) {
+            mixed_format_expected[layer * 4 + y * 2 + x] =
+                color_capacity_guest[word];
+          });
+      auto mixed_format_readback = CreateHostBuffer(
+          name, 16 * sizeof(u32), vk::BufferUsageFlagBits::eTransferDst,
+          std::vector<u32>(16, 0));
+      mixed_format_native.Download(std::span{&color_capacity_copy, 1},
+                                   mixed_format_readback.buffer, 0,
+                                   mixed_format_readback.size);
+      HostReadBarrier(mixed_format_readback.buffer, mixed_format_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+      scheduler.Finish();
+      Require(
+          name, "mixed-format reshape preserves GPU bits",
+          ReadBuffer(name, mixed_format_readback, 16) == mixed_format_expected,
+          "compatible-format reshape converted or lost GPU-written guest bits");
+      DestroyBuffer(&mixed_format_readback);
       const std::array<std::array<float, 4>, 2> expected_ms_depth{{
           {0x2000 / 65535.0f, 0xe000 / 65535.0f, 0.0f, 0.0f},
           {0.0f, 0x4000 / 65535.0f, 0x8000 / 65535.0f, 1.0f},
