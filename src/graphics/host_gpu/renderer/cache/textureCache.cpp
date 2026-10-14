@@ -1311,6 +1311,11 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 		if (result && !m_slot_images[result].depth_id) {
 			auto& resolved = m_slot_images[result];
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
+				// The new native format is initialized from guest-layout buffer bytes.
+				// An earlier buffer snapshot may predate the current image writes.
+				if (resolved.SafeToDownload() && !PublishImageToBuffer(resolved)) {
+					EXIT("TextureCache: cannot publish exact-format alias contents\n");
+				}
 				result = {};
 			} else if (resolved.info.resources < desc.info.resources) {
 				FreeImage(result);

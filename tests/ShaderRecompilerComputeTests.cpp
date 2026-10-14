@@ -7153,6 +7153,19 @@ public:
               !texture_cache.GetImage(exact_buffer_image).IsBufferModified() &&
               texture_cache.GetImage(exact_buffer_image).IsGpuModified(),
           "exact replacement copy transferred cache ownership");
+      constexpr uint32_t exact_gpu_value = 0x3f654321u;
+      auto &exact_source_native = texture_cache.GetImage(exact_buffer_image);
+      exact_source_native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                                  vk::AccessFlagBits2::eTransferWrite, {},
+                                  command.Handle());
+      vk::ClearColorValue exact_clear{};
+      exact_clear.uint32[0] = exact_gpu_value;
+      const vk::ImageSubresourceRange exact_range{
+          vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+      command.Handle().clearColorImage(exact_source_native.backing.image,
+                                       vk::ImageLayout::eTransferDstOptimal,
+                                       &exact_clear, 1, &exact_range);
+      texture_cache.MarkGpuWritten(exact_buffer_image);
       auto exact_float_desc = exact_buffer_desc;
       exact_float_desc.info.pixel_format = vk::Format::eR32Sfloat;
       exact_float_desc.info.guest_format = Prospero::BufferFormat::k32Float;
@@ -7161,15 +7174,16 @@ public:
           texture_cache.FindImage(exact_float_desc, true);
       (void)texture_cache.FindTexture(exact_float_image, exact_float_desc);
       Require(
-          name, "Buffer-superseded exact coexistence",
+          name, "exact-format publication ownership",
           exact_float_image != exact_buffer_image &&
               TextureCacheTestAccess::Contains(texture_cache,
                                                exact_buffer_image) &&
-              texture_cache.GetImage(exact_buffer_image).IsGpuModified() &&
+              !texture_cache.GetImage(exact_buffer_image).IsGpuModified() &&
+              texture_cache.GetImage(exact_buffer_image).IsBufferModified() &&
               !texture_cache.GetImage(exact_float_image).IsBufferModified() &&
               !texture_cache.GetImage(exact_float_image).IsGpuModified(),
-          "exact-format lookup retired its old record or transferred Buffer "
-          "ownership");
+          "exact-format lookup did not publish the native owner before "
+          "initializing its alias");
       auto exact_buffer_readback = CreateHostBuffer(
           name, sizeof(exact_buffer_value),
           vk::BufferUsageFlagBits::eTransferDst, std::vector<u32>{0});
@@ -8573,7 +8587,7 @@ public:
               "native image bytes");
       Require(name, "Buffer-superseded exact content",
               ReadBuffer(name, exact_buffer_readback, 1) ==
-                  std::vector<u32>{exact_buffer_value},
+                  std::vector<u32>{exact_gpu_value},
               "exact-format recreation initialized from "
               "stale guest bytes");
       Require(name, "partial-page CPU refresh content",
