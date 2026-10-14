@@ -840,15 +840,45 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const auto current_tick = m_scheduler.CurrentTick();
 	const bool old_enough_to_retire =
 	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval;
-	const auto retire_overlap = [&] {
+	const auto preserve_overlap = [&](bool retire) {
+		// Native-only multisample/stencil records may coexist during discovery.
+		// Their dedicated paths cannot be replaced by a guest-buffer transfer.
+		// Age-based retirement still has to prove that their contents are safe.
+		if (!retire && (cached.backing.samples > 1 || cached.depth_id)) {
+			return;
+		}
 		if (cached.IsMaybeCpuDirty()) {
 			(void)cached.ResolveMaybeCpuHash(cached.HashGuestEdges());
 		}
-		// Age permits eviction, but does not make native GPU writes disposable.
-		if (cached.SafeToDownload() && !PublishImageToBuffer(cached)) {
-			EXIT("TextureCache: cannot publish aged overlap contents before retirement\n");
+		// Fresh overlaps also need current guest bytes, even when their native
+		// records remain cached. Preserve a previously merged image first.
+		if (cached.SafeToDownload()) {
+			auto* merged =
+			    merged_id && merged_id != cached_id ? &m_slot_images[merged_id] : nullptr;
+			if (merged != nullptr) {
+				if (merged->IsMaybeCpuDirty()) {
+					(void)merged->ResolveMaybeCpuHash(merged->HashGuestEdges());
+				}
+				if (merged->SafeToDownload() && !PublishImageToBuffer(*merged)) {
+					EXIT("TextureCache: cannot publish merged overlap contents\n");
+				}
+			}
+			if (!PublishImageToBuffer(cached)) {
+				EXIT("TextureCache: cannot publish overlapping image contents: "
+				     "cached=0x%016" PRIx64 "+0x%" PRIx64 " format=%u samples=%u stencil_proxy=%u "
+				     "requested=0x%016" PRIx64 "+0x%" PRIx64 " format=%u samples=%u\n",
+				     cached.info.data.address, cached.info.data.size,
+				     static_cast<uint32_t>(cached.info.pixel_format), cached.info.samples,
+				     cached.depth_id ? 1u : 0u, requested.data.address, requested.data.size,
+				     static_cast<uint32_t>(requested.pixel_format), requested.samples);
+			}
+			if (merged != nullptr) {
+				merged->MarkBufferModified();
+			}
 		}
-		FreeImage(cached_id);
+		if (retire) {
+			FreeImage(cached_id);
+		}
 	};
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
@@ -899,9 +929,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			                        left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
 			                        left.surface_z == right.surface_z;
 		                 }))) {
-			if (old_enough_to_retire) {
-				retire_overlap();
-			}
+			preserve_overlap(old_enough_to_retire);
 			return {merged_id};
 		}
 		if (requested.GetColorTransform() != cached.info.GetColorTransform()) {
@@ -984,9 +1012,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		FreeImage(cached_id);
 		return {merged_id};
 	}
-	if (requested.data.address >= cached.info.data.address && old_enough_to_retire) {
-		retire_overlap();
-	}
+	preserve_overlap(requested.data.address >= cached.info.data.address && old_enough_to_retire);
 	return {merged_id};
 }
 

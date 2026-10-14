@@ -9862,8 +9862,10 @@ public:
                   !boundary_buffer_cache.HasGpuDirtyBytes(final_word_address, sizeof(uint32_t)),
               "a final-byte CPU read did not publish the GPU-owned final word");
 
-      for (const bool maybe_cpu_dirty : {false, true}) {
-        const uint64_t aged_offset = 0x2b00000 + (maybe_cpu_dirty ? 0x1000 : 0);
+      for (const uint32_t overlap_case : {0u, 1u, 2u}) {
+        const bool maybe_cpu_dirty = overlap_case == 1;
+        const bool retain = overlap_case == 2;
+        const uint64_t aged_offset = 0x2b00000 + overlap_case * 0x1000;
         constexpr uint32_t aged_value = 0x7a3512cdu;
         std::memset(memory + aged_offset, 0, 64);
         auto aged_desc =
@@ -9887,7 +9889,7 @@ public:
         while (scheduler.CurrentTick() <= 33) {
           scheduler.Finish();
         }
-        aged_native.tick_accessed_last = 0;
+        aged_native.tick_accessed_last = retain ? scheduler.CurrentTick() : 0;
         if (maybe_cpu_dirty) {
           aged_native.MarkMaybeCpuDirty();
         }
@@ -9897,8 +9899,9 @@ public:
                            Prospero::ImageType::kColor2D, {2, 2, 1}, 1, 4, 1);
         const auto interior_id = texture_cache.FindImage(interior_desc);
         Require(name, "aged overlap retirement",
-                !TextureCacheTestAccess::Contains(texture_cache, aged_id),
-                "aged incompatible overlap was not retired");
+                TextureCacheTestAccess::Contains(texture_cache, aged_id) ==
+                    retain,
+                "overlap retirement did not respect the cache age threshold");
         (void)texture_cache.FindTexture(interior_id, interior_desc);
         auto &interior = texture_cache.GetImage(interior_id);
         auto aged_readback =
@@ -9913,10 +9916,12 @@ public:
                         vk::PipelineStageFlagBits::eTransfer,
                         vk::AccessFlagBits::eTransferWrite);
         scheduler.Finish();
-        Require(name, "aged overlap GPU contents",
+        Require(name,
+                retain ? "retained overlap GPU contents"
+                       : "aged overlap GPU contents",
                 ReadBuffer(name, aged_readback, 4) ==
                     std::vector<u32>(4, aged_value),
-                "retiring an aged overlap discarded authoritative GPU bytes");
+                "overlap resolution discarded authoritative GPU bytes");
         DestroyBuffer(&aged_readback);
       }
       resources.UnmapMemory(base, allocation_size);
