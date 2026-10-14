@@ -7206,6 +7206,74 @@ public:
         DestroyBuffer(&readback);
       }
 
+      // A single buffer range can contain multiple disjoint native writers and
+      // untouched guest bytes. No earlier buffer write may prime this fixture.
+      constexpr uint64_t multi_read_offset = 0x1b00000;
+      constexpr uint32_t multi_read_untouched = 0xdeadbeefu;
+      std::vector<u32> multi_read_expected(16, multi_read_untouched);
+      std::memcpy(memory + multi_read_offset, multi_read_expected.data(), 64);
+      std::array<Libs::Graphics::ImageId, 2> multi_read_images{};
+      for (uint32_t index = 0; index < multi_read_images.size(); ++index) {
+        const uint32_t offset = 4 + index * 32;
+        const uint32_t value = 0x12345678u + index;
+        auto desc = MakeLinearDesc(
+            base + multi_read_offset + offset, 16, vk::Format::eR32Uint,
+            Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
+            {2, 2, 1}, 1, 4, 1);
+        const auto id = texture_cache.FindImage(desc);
+        multi_read_images[index] = id;
+        vk::ClearValue painted{};
+        painted.color.uint32 = std::array{value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+        std::fill_n(multi_read_expected.begin() + offset / sizeof(u32), 4,
+                    value);
+      }
+      Require(name, "fresh image read fixture",
+              !resources.GetBufferCache().IsRegionGpuModified(
+                  base + multi_read_offset, 64),
+              "prior buffer writes primed the native image read fixture");
+      for (const uint32_t size : {4u, 64u}) {
+        const uint32_t offset = size == 4 ? 16 : 0;
+        auto readable = resources.GetBufferCache().ObtainBuffer(
+            base + multi_read_offset + offset, size, false, true);
+        Require(name, "multi-image buffer allocation",
+                readable.first != nullptr,
+                "multi-image buffer read allocation failed");
+        auto readback = CreateHostBuffer(
+            name, size, vk::BufferUsageFlagBits::eTransferDst, {});
+        const vk::MemoryBarrier ready{
+            .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+            .dstAccessMask = vk::AccessFlagBits::eTransferRead};
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eAllCommands,
+            vk::PipelineStageFlagBits::eTransfer, {}, 1, &ready, 0, nullptr, 0,
+            nullptr);
+        const vk::BufferCopy copy{readable.second, 0, size};
+        scheduler.Current().Handle().copyBuffer(readable.first->Handle(),
+                                                readback.buffer, 1, &copy);
+        HostReadBarrier(readback.buffer, size,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        const std::vector<u32> expected(
+            multi_read_expected.begin() + offset / sizeof(u32),
+            multi_read_expected.begin() + (offset + size) / sizeof(u32));
+        Require(name,
+                size == 4 ? "fresh interior image read"
+                          : "multiple image sources in buffer read",
+                ReadBuffer(name, readback, size / sizeof(u32)) == expected,
+                "buffer read lost a native writer or untouched guest bytes");
+        for (const auto id : multi_read_images) {
+          Require(name, "multiple image read ownership",
+                  texture_cache.GetImage(id).IsGpuModified() &&
+                      !texture_cache.GetImage(id).IsBufferModified(),
+                  "read-only range changed native source ownership");
+        }
+        DestroyBuffer(&readback);
+      }
+
       constexpr uint64_t exact_buffer_offset = 0x90000;
       constexpr uint32_t exact_buffer_value = 0x3f234567u;
       std::memcpy(memory + exact_buffer_offset, &exact_buffer_value,
