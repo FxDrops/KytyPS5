@@ -7956,6 +7956,81 @@ public:
                   capacity_native.IsGpuModified(),
               "lexicographic mip comparison hid a missing array layer");
 
+      constexpr uint64_t color_capacity_offset = 0x2d00000;
+      std::vector<u32> color_capacity_guest(layered_guest_size / sizeof(u32),
+                                            std::bit_cast<u32>(0.125f));
+      std::memcpy(memory + color_capacity_offset, color_capacity_guest.data(),
+                  layered_guest_size);
+      auto color_capacity_source = layered_color;
+      color_capacity_source.info.data.address = base + color_capacity_offset;
+      const auto color_capacity_source_id =
+          texture_cache.FindImage(color_capacity_source);
+      (void)texture_cache.FindTexture(color_capacity_source_id,
+                                      color_capacity_source);
+      auto &color_capacity_owner =
+          texture_cache.GetImage(color_capacity_source_id);
+      color_capacity_owner.Transit(vk::ImageLayout::eTransferDstOptimal,
+                                   vk::AccessFlagBits2::eTransferWrite, {},
+                                   command.Handle());
+      vk::ClearColorValue capacity_clear{};
+      capacity_clear.float32[0] = 0.75f;
+      const vk::ImageSubresourceRange capacity_range{
+          vk::ImageAspectFlagBits::eColor, 0, 2, 0, 2};
+      command.Handle().clearColorImage(color_capacity_owner.backing.image,
+                                       vk::ImageLayout::eTransferDstOptimal,
+                                       capacity_clear, capacity_range);
+      texture_cache.MarkGpuWritten(color_capacity_source_id);
+      const auto ForEachCapacityWord = [&](const ImageInfo &layout,
+                                           auto visit) {
+        for (const auto &copy : layout.BufferCopies()) {
+          const auto pitch = copy.bufferRowLength != 0 ? copy.bufferRowLength
+                                                       : copy.imageExtent.width;
+          const auto rows = copy.bufferImageHeight != 0
+                                ? copy.bufferImageHeight
+                                : copy.imageExtent.height;
+          for (uint32_t layer = 0; layer < copy.imageSubresource.layerCount;
+               ++layer) {
+            for (uint32_t y = 0; y < copy.imageExtent.height; ++y) {
+              for (uint32_t x = 0; x < copy.imageExtent.width; ++x) {
+                const auto word = copy.bufferOffset / sizeof(u32) +
+                                  (uint64_t{layer} * rows + y) * pitch + x;
+                Require(name, "color capacity guest bounds",
+                        word < color_capacity_guest.size(),
+                        "capacity test exceeded its guest allocation");
+                visit(word, copy.imageSubresource.mipLevel,
+                      copy.imageSubresource.baseArrayLayer + layer, y, x);
+              }
+            }
+          }
+        }
+      };
+      ForEachCapacityWord(
+          color_capacity_source.info,
+          [&](uint64_t word, uint32_t, uint32_t, uint32_t, uint32_t) {
+            color_capacity_guest[word] = std::bit_cast<u32>(0.75f);
+          });
+      auto color_capacity_request = color_capacity_source;
+      color_capacity_request.info.resources = {1, 4};
+      color_capacity_request.info.UpdateSize();
+      color_capacity_request.view_info.level_count = 1;
+      color_capacity_request.view_info.layer_count = 4;
+      std::vector<u32> color_capacity_expected(16);
+      ForEachCapacityWord(
+          color_capacity_request.info,
+          [&](uint64_t word, uint32_t, uint32_t layer, uint32_t y, uint32_t x) {
+            color_capacity_expected[layer * 4 + y * 2 + x] =
+                color_capacity_guest[word];
+          });
+      const auto color_capacity_result =
+          texture_cache.FindImage(color_capacity_request);
+      Require(
+          name, "fewer mips with more color layers",
+          color_capacity_result != color_capacity_source_id &&
+              texture_cache.GetImage(color_capacity_result).backing.layers == 4,
+          "color alias returned a backing with too few layers");
+      (void)texture_cache.FindTexture(color_capacity_result,
+                                      color_capacity_request);
+
       constexpr uint64_t replacement_offset = 0x18000;
       constexpr uint64_t replacement_size = 0x2000;
       constexpr uint32_t replacement_pixel = 0xcafebabeu;
@@ -8271,6 +8346,26 @@ public:
                       vk::PipelineStageFlagBits::eTransfer,
                       vk::AccessFlagBits::eTransferWrite);
 
+      auto color_capacity_readback = CreateHostBuffer(
+          name, 16 * sizeof(u32), vk::BufferUsageFlagBits::eTransferDst,
+          std::vector<u32>(16, 0));
+      auto &color_capacity_native =
+          texture_cache.GetImage(color_capacity_result);
+      color_capacity_native.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                                    vk::AccessFlagBits2::eTransferRead, {},
+                                    command.Handle());
+      auto color_capacity_copy = layered_copy;
+      color_capacity_copy.imageSubresource = {vk::ImageAspectFlagBits::eColor,
+                                              0, 0, 4};
+      command.Handle().copyImageToBuffer(color_capacity_native.backing.image,
+                                         vk::ImageLayout::eTransferSrcOptimal,
+                                         color_capacity_readback.buffer, 1,
+                                         &color_capacity_copy);
+      HostReadBarrier(color_capacity_readback.buffer,
+                      color_capacity_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+
       vk::ShaderModuleCreateInfo module_info{};
       module_info.sType = vk::StructureType::eShaderModuleCreateInfo;
       module_info.codeSize = sizeof(GPU_TEST_MS_DEPTH_SPV);
@@ -8496,6 +8591,73 @@ public:
               ReadBuffer(name, capacity_readback, 8) == layered_words,
               "growing layers while shrinking mips lost shared depth values");
       DestroyBuffer(&capacity_readback);
+      Require(name, "color capacity preserves guest-byte mapping",
+              ReadBuffer(name, color_capacity_readback, 16) ==
+                  color_capacity_expected,
+              "changed array strides lost GPU writes or untouched guest bytes");
+      DestroyBuffer(&color_capacity_readback);
+      Require(
+          name, "color capacity oracle exercises padding",
+          std::ranges::find(color_capacity_expected,
+                            std::bit_cast<u32>(0.125f)) !=
+                  color_capacity_expected.end() &&
+              std::ranges::find(color_capacity_expected,
+                                std::bit_cast<u32>(0.75f)) !=
+                  color_capacity_expected.end(),
+          "capacity test did not distinguish padding from GPU-written pixels");
+      auto &reverse_source = texture_cache.GetImage(color_capacity_result);
+      reverse_source.Transit(vk::ImageLayout::eTransferDstOptimal,
+                             vk::AccessFlagBits2::eTransferWrite, {},
+                             command.Handle());
+      capacity_clear.float32[0] = 0.5f;
+      const vk::ImageSubresourceRange reverse_range{
+          vk::ImageAspectFlagBits::eColor, 0, 1, 0, 4};
+      command.Handle().clearColorImage(reverse_source.backing.image,
+                                       vk::ImageLayout::eTransferDstOptimal,
+                                       capacity_clear, reverse_range);
+      texture_cache.MarkGpuWritten(color_capacity_result);
+      ForEachCapacityWord(
+          color_capacity_request.info,
+          [&](uint64_t word, uint32_t, uint32_t, uint32_t, uint32_t) {
+            color_capacity_guest[word] = std::bit_cast<u32>(0.5f);
+          });
+      auto reverse_request = color_capacity_source;
+      const auto reverse_id = texture_cache.FindImage(reverse_request);
+      auto &reverse_native = texture_cache.GetImage(reverse_id);
+      Require(name, "more color mips with fewer layers",
+              reverse_id != color_capacity_result &&
+                  reverse_native.backing.layers == 2 &&
+                  reverse_native.backing.mip_levels == 2,
+              "reverse alias reused a backing with too few mip levels");
+      (void)texture_cache.FindTexture(reverse_id, reverse_request);
+      std::vector<u32> reverse_expected(10);
+      ForEachCapacityWord(reverse_request.info, [&](uint64_t word, uint32_t mip,
+                                                    uint32_t layer, uint32_t y,
+                                                    uint32_t x) {
+        reverse_expected[mip == 0 ? layer * 4 + y * 2 + x : 8 + layer] =
+            color_capacity_guest[word];
+      });
+      auto reverse_readback = CreateHostBuffer(
+          name, 10 * sizeof(u32), vk::BufferUsageFlagBits::eTransferDst,
+          std::vector<u32>(10, 0));
+      std::array<vk::BufferImageCopy, 2> reverse_copies{};
+      reverse_copies[0].imageSubresource = {vk::ImageAspectFlagBits::eColor, 0,
+                                            0, 2};
+      reverse_copies[0].imageExtent = {2, 2, 1};
+      reverse_copies[1].bufferOffset = 8 * sizeof(u32);
+      reverse_copies[1].imageSubresource = {vk::ImageAspectFlagBits::eColor, 1,
+                                            0, 2};
+      reverse_copies[1].imageExtent = {1, 1, 1};
+      reverse_native.Download(reverse_copies, reverse_readback.buffer, 0,
+                              reverse_readback.size);
+      HostReadBarrier(reverse_readback.buffer, reverse_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+      scheduler.Finish();
+      Require(name, "reverse color alias preserves guest-byte mapping",
+              ReadBuffer(name, reverse_readback, 10) == reverse_expected,
+              "reverse reshape lost updated GPU pixels or retained mip bytes");
+      DestroyBuffer(&reverse_readback);
       const std::array<std::array<float, 4>, 2> expected_ms_depth{{
           {0x2000 / 65535.0f, 0xe000 / 65535.0f, 0.0f, 0.0f},
           {0.0f, 0x4000 / 65535.0f, 0x8000 / 65535.0f, 1.0f},

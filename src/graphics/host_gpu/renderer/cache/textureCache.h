@@ -31,7 +31,6 @@ struct TextureCacheTestAccess;
 
 namespace BcAlias {
 [[nodiscard]] bool Matches(const ImageInfo& requested, const ImageInfo& cached);
-[[nodiscard]] bool Publish(TextureCache& cache, Image& image);
 void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
 } // namespace BcAlias
 
@@ -145,6 +144,7 @@ private:
 	                                                uint32_t metadata_base_layer);
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] bool          CanDownload(const Image& image) const;
+	[[nodiscard]] bool          PublishImageToBuffer(Image& image);
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
 	                   uint64_t destination_size, uint32_t levels);
@@ -189,7 +189,6 @@ private:
 	friend class BufferCache;
 	friend class RenderExecutor;
 	friend bool BcAlias::Matches(const ImageInfo&, const ImageInfo&);
-	friend bool BcAlias::Publish(TextureCache&, Image&);
 	friend void BcAlias::Resolve(TextureCache&, ImageId, ImageId);
 };
 

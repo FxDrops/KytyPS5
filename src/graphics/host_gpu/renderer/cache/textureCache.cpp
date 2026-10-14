@@ -755,30 +755,29 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	return replacement_id;
 }
 
+bool TextureCache::PublishImageToBuffer(Image& image) {
+	if (!CanDownload(image)) {
+		return false;
+	}
+	// Preserve guest padding before overlaying the native GPU image contents.
+	auto [buffer, offset] =
+	    m_buffer_cache.ObtainBuffer(image.info.data.address, image.info.data.size, true);
+	DownloadImage(image, *buffer, offset, image.info.data.size, image.info.resources.levels);
+	image.ClearGpuModified();
+	image.MarkBufferModified();
+	return true;
+}
+
 namespace BcAlias {
 
 bool Matches(const ImageInfo& requested, const ImageInfo& cached) {
 	return requested.guest_format != cached.guest_format &&
-	       requested.IsBlock() != cached.IsBlock() &&
-	       requested.tile_mode == cached.tile_mode &&
-	       requested.bytes_per_block == cached.bytes_per_block &&
-	       requested.samples == 1 && cached.samples == 1 &&
+	       requested.IsBlock() != cached.IsBlock() && requested.tile_mode == cached.tile_mode &&
+	       requested.bytes_per_block == cached.bytes_per_block && requested.samples == 1 &&
+	       cached.samples == 1 &&
 	       (requested.data != cached.data || requested.resources != cached.resources ||
 	        requested.BlockExtent() != cached.BlockExtent()) &&
 	       !TextureCache::SameBacking(cached, requested, false);
-}
-
-bool Publish(TextureCache& cache, Image& image) {
-	if (!cache.CanDownload(image)) {
-		return false;
-	}
-	// ObtainBuffer preserves padding and records ownership before the GPU-only transfer.
-	auto [buffer, offset] =
-	    cache.m_buffer_cache.ObtainBuffer(image.info.data.address, image.info.data.size, true);
-	cache.DownloadImage(image, *buffer, offset, image.info.data.size, image.info.resources.levels);
-	image.ClearGpuModified();
-	image.MarkBufferModified();
-	return true;
 }
 
 void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
@@ -787,10 +786,10 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 	// PS5 raw block images can span several packed BC mips. Transfer their complete
 	// guest bytes, including tail padding, before retiring the incompatible backing.
 	if (cached.SafeToDownload()) {
-		if (merged && merged->SafeToDownload() && !Publish(cache, *merged)) {
+		if (merged && merged->SafeToDownload() && !cache.PublishImageToBuffer(*merged)) {
 			return;
 		}
-		if (!Publish(cache, cached)) {
+		if (!cache.PublishImageToBuffer(cached)) {
 			return;
 		}
 		if (merged) {
@@ -825,6 +824,32 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	    requested.BlockExtent() == cached.info.BlockExtent() && requested_block == cached_block) {
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
 			return {depth_id};
+		}
+		const bool reshaped_subresources =
+		    (requested.resources.levels < cached.info.resources.levels &&
+			 requested.resources.layers > cached.info.resources.layers) ||
+		    (requested.resources.levels > cached.info.resources.levels &&
+			 requested.resources.layers < cached.info.resources.layers);
+		if (!requested.IsDepth() && !cached.info.IsDepth() && reshaped_subresources &&
+		    requested.pixel_format == cached.info.pixel_format &&
+		    requested.type == cached.info.type && requested.tile_mode == cached.info.tile_mode) {
+			// Mixed mip/layer growth can change the guest stride. Preserve byte
+			// ownership instead of copying identically numbered native subresources.
+			RefreshCopySource(cached_id);
+			if (merged_id && merged_id != cached_id) {
+				RefreshCopySource(merged_id);
+				auto& merged = m_slot_images[merged_id];
+				if (merged.SafeToDownload() && !PublishImageToBuffer(merged)) {
+					EXIT("TextureCache: cannot preserve merged image for a mip/layer reshape\n");
+				}
+				merged.MarkBufferModified();
+			}
+			if (cached.SafeToDownload() && !PublishImageToBuffer(cached)) {
+				EXIT("TextureCache: cannot preserve image for a mip/layer reshape\n");
+			}
+			cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+			FreeImage(cached_id);
+			return {merged_id};
 		}
 		// Equal pitch does not imply equal mip placement: a changed extent can move
 		// a level into or out of the mip tail. These are separate guest layouts.
