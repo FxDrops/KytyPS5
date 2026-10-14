@@ -7274,6 +7274,77 @@ public:
         DestroyBuffer(&readback);
       }
 
+      constexpr uint64_t native_copy_destination = 0x1b10000;
+      const auto native_copy_source = base + multi_read_offset + 16;
+      Require(name, "native copy source has no buffer writer",
+              !resources.GetBufferCache().IsRegionGpuModified(
+                  native_copy_source, 4) &&
+                  !resources.GetBufferCache().IsRegionGpuModified(
+                      base + native_copy_destination, 4),
+              "native image copy fixture bypassed the CPU-copy decision");
+      resources.GetBufferCache().CopyBuffer(
+          base + native_copy_destination, native_copy_source, 4, false, false);
+      auto copied = resources.GetBufferCache().ObtainBuffer(
+          base + native_copy_destination, 4, false, false);
+      auto copy_readback =
+          CreateHostBuffer(name, 4, vk::BufferUsageFlagBits::eTransferDst, {0});
+      const vk::MemoryBarrier copy_ready{
+          .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+          .dstAccessMask = vk::AccessFlagBits::eTransferRead};
+      scheduler.Current().Handle().pipelineBarrier(
+          vk::PipelineStageFlagBits::eAllCommands,
+          vk::PipelineStageFlagBits::eTransfer, {}, 1, &copy_ready, 0, nullptr,
+          0, nullptr);
+      const vk::BufferCopy native_copy{copied.second, 0, 4};
+      scheduler.Current().Handle().copyBuffer(
+          copied.first->Handle(), copy_readback.buffer, 1, &native_copy);
+      HostReadBarrier(copy_readback.buffer, 4,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+      scheduler.Finish();
+      Require(name, "copy from interior native image",
+              ReadBuffer(name, copy_readback, 1) ==
+                  std::vector<u32>{0x12345678u},
+              "copy used stale guest backing for a native image source");
+      DestroyBuffer(&copy_readback);
+
+      constexpr uint64_t fresh_copy_source = 0x1b40000;
+      constexpr uint32_t fresh_write_value = 0xabcdef01u;
+      std::memcpy(memory + fresh_copy_source, &fresh_write_value, 4);
+      for (uint32_t method = 0; method < 2; ++method) {
+        const auto address = base + 0x1b20000 + method * 0x10000;
+        auto desc = MakeLinearDesc(
+            address, 16, vk::Format::eR32Uint, Prospero::BufferFormat::k32UInt,
+            Prospero::ImageType::kColor2D, {2, 2, 1}, 1, 4, 1);
+        const auto id = texture_cache.FindImage(desc);
+        vk::ClearValue painted{};
+        painted.color.uint32 = std::array{0x76543210u, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), id,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+        Require(name, "fresh native destination has no buffer writer",
+                !resources.GetBufferCache().IsRegionGpuModified(address, 16) &&
+                    !resources.GetBufferCache().IsRegionGpuModified(
+                        base + fresh_copy_source, 4),
+                "prior buffer writes primed the native destination fixture");
+        if (method == 0) {
+          resources.GetBufferCache().FillBuffer(address + 4, 4,
+                                                fresh_write_value, false);
+        } else {
+          resources.GetBufferCache().CopyBuffer(
+              address + 4, base + fresh_copy_source, 4, false, false);
+        }
+        (void)texture_cache.FindTexture(id, desc);
+        Require(
+            name,
+            method == 0 ? "fill into fresh native image"
+                        : "copy into fresh native image",
+            ReadCachedTexel(name, context, id, {}, {2, 2, 1}) ==
+                std::vector<u32>{0x76543210u, fresh_write_value, 0x76543210u,
+                                 0x76543210u},
+            "partial write through CPU fast path lost untouched GPU texels");
+      }
+
       constexpr uint64_t exact_buffer_offset = 0x90000;
       constexpr uint32_t exact_buffer_value = 0x3f234567u;
       std::memcpy(memory + exact_buffer_offset, &exact_buffer_value,
