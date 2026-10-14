@@ -7934,6 +7934,9 @@ public:
       constexpr uint64_t capacity_offset = 0x2e00000;
       std::memcpy(memory + capacity_offset, memory + layered_offset,
                   layered_guest_size);
+      std::vector<u32> depth_capacity_guest(layered_guest_size / sizeof(u32));
+      std::memcpy(depth_capacity_guest.data(), memory + capacity_offset,
+                  layered_guest_size);
       auto capacity_source = layered_color;
       capacity_source.info.data.address = base + capacity_offset;
       capacity_source.type = BindingType::DepthTarget;
@@ -7944,6 +7947,16 @@ public:
           vk::ImageUsageFlagBits::eDepthStencilAttachment;
       const auto capacity_source_id = texture_cache.FindImage(capacity_source);
       (void)texture_cache.FindDepthTarget(capacity_source_id, capacity_source);
+      auto &depth_capacity_source = texture_cache.GetImage(capacity_source_id);
+      depth_capacity_source.Transit(vk::ImageLayout::eTransferDstOptimal,
+                                    vk::AccessFlagBits2::eTransferWrite, {},
+                                    command.Handle());
+      command.Handle().clearDepthStencilImage(
+          depth_capacity_source.backing.image,
+          vk::ImageLayout::eTransferDstOptimal,
+          vk::ClearDepthStencilValue{0.75f, 0},
+          vk::ImageSubresourceRange{vk::ImageAspectFlagBits::eDepth, 0, 2, 0,
+                                    2});
       texture_cache.MarkGpuWritten(capacity_source_id);
       auto capacity_request = layered_depth;
       capacity_request.info.data.address = base + capacity_offset;
@@ -7952,9 +7965,9 @@ public:
       Require(name, "fewer mips with more depth layers",
               capacity_result != capacity_source_id &&
                   capacity_native.backing.layers == 4 &&
-                  capacity_native.backing.mip_levels == 1 &&
-                  capacity_native.IsGpuModified(),
+                  capacity_native.backing.mip_levels == 1,
               "lexicographic mip comparison hid a missing array layer");
+      (void)texture_cache.FindDepthTarget(capacity_result, capacity_request);
 
       constexpr uint64_t color_capacity_offset = 0x2d00000;
       std::vector<u32> color_capacity_guest(layered_guest_size / sizeof(u32),
@@ -8004,6 +8017,18 @@ public:
           }
         }
       };
+      ForEachCapacityWord(
+          capacity_source.info,
+          [&](uint64_t word, uint32_t, uint32_t, uint32_t, uint32_t) {
+            depth_capacity_guest[word] = std::bit_cast<u32>(0.75f);
+          });
+      std::vector<u32> depth_capacity_expected(16);
+      ForEachCapacityWord(
+          capacity_request.info,
+          [&](uint64_t word, uint32_t, uint32_t layer, uint32_t y, uint32_t x) {
+            depth_capacity_expected[layer * 4 + y * 2 + x] =
+                depth_capacity_guest[word];
+          });
       ForEachCapacityWord(
           color_capacity_source.info,
           [&](uint64_t word, uint32_t, uint32_t, uint32_t, uint32_t) {
@@ -8332,16 +8357,18 @@ public:
                       vk::AccessFlagBits::eTransferWrite);
 
       auto capacity_readback = CreateHostBuffer(
-          name, 8 * sizeof(float), vk::BufferUsageFlagBits::eTransferDst,
-          std::vector<u32>(8, 0));
+          name, 16 * sizeof(float), vk::BufferUsageFlagBits::eTransferDst,
+          std::vector<u32>(16, 0));
       auto &capacity_depth_native = texture_cache.GetImage(capacity_result);
       capacity_depth_native.Transit(vk::ImageLayout::eTransferSrcOptimal,
                                     vk::AccessFlagBits2::eTransferRead, {},
                                     command.Handle());
+      auto depth_capacity_copy = layered_copy;
+      depth_capacity_copy.imageSubresource.layerCount = 4;
       command.Handle().copyImageToBuffer(capacity_depth_native.backing.image,
                                          vk::ImageLayout::eTransferSrcOptimal,
                                          capacity_readback.buffer, 1,
-                                         &layered_copy);
+                                         &depth_capacity_copy);
       HostReadBarrier(capacity_readback.buffer, capacity_readback.size,
                       vk::PipelineStageFlagBits::eTransfer,
                       vk::AccessFlagBits::eTransferWrite);
@@ -8587,9 +8614,10 @@ public:
       }
       Require(name, "layered depth common-mip content", layered_content,
               "depth/color conversion changed a shared array-layer value");
-      Require(name, "depth layer growth preserves common mip content",
-              ReadBuffer(name, capacity_readback, 8) == layered_words,
-              "growing layers while shrinking mips lost shared depth values");
+      Require(name, "depth reshape preserves guest-byte mapping",
+              ReadBuffer(name, capacity_readback, 16) ==
+                  depth_capacity_expected,
+              "depth reshape changed guest-byte mapping");
       DestroyBuffer(&capacity_readback);
       Require(name, "color capacity preserves guest-byte mapping",
               ReadBuffer(name, color_capacity_readback, 16) ==

@@ -822,15 +822,15 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
 	if (requested.data.address == cached.info.data.address &&
 	    requested.BlockExtent() == cached.info.BlockExtent() && requested_block == cached_block) {
-		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
-			return {depth_id};
-		}
 		const bool reshaped_subresources =
 		    (requested.resources.levels < cached.info.resources.levels &&
 			 requested.resources.layers > cached.info.resources.layers) ||
 		    (requested.resources.levels > cached.info.resources.levels &&
 			 requested.resources.layers < cached.info.resources.layers);
-		if (!requested.IsDepth() && !cached.info.IsDepth() && reshaped_subresources &&
+		const bool depth_has_auxiliary_planes =
+		    requested.IsDepth() && (requested.HasStencil() || cached.info.HasStencil() ||
+			                        requested.HasMetadata() || cached.info.HasMetadata());
+		if (!depth_has_auxiliary_planes && reshaped_subresources &&
 		    requested.pixel_format == cached.info.pixel_format &&
 		    requested.type == cached.info.type && requested.tile_mode == cached.info.tile_mode) {
 			// Mixed mip/layer growth can change the guest stride. Preserve byte
@@ -850,6 +850,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
 			FreeImage(cached_id);
 			return {merged_id};
+		}
+		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
+			return {depth_id};
 		}
 		// Equal pitch does not imply equal mip placement: a changed extent can move
 		// a level into or out of the mip tail. These are separate guest layouts.
