@@ -8898,6 +8898,84 @@ public:
         growth_source_id = growth_id;
         growth_source_desc = growth_request;
       }
+      {
+        constexpr uint64_t expansion_offset = color_capacity_offset + 0x10000;
+        constexpr u32 expansion_value = 0xabcdef31u;
+        std::vector<u32> expansion_shadow(2 * layered_guest_size / sizeof(u32),
+                                          0x12345678u);
+        std::memcpy(memory + expansion_offset, expansion_shadow.data(),
+                    expansion_shadow.size() * sizeof(u32));
+        auto expansion_source = mixed_format_request;
+        expansion_source.info.data.address = base + expansion_offset;
+        const auto expansion_source_id =
+            texture_cache.FindImage(expansion_source);
+        (void)texture_cache.FindTexture(expansion_source_id, expansion_source);
+        auto &native = texture_cache.GetImage(expansion_source_id);
+        native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                       vk::AccessFlagBits2::eTransferWrite, {},
+                       command.Handle());
+        vk::ClearColorValue expansion_clear{};
+        expansion_clear.uint32[0] = expansion_value;
+        const vk::ImageSubresourceRange expansion_range{
+            vk::ImageAspectFlagBits::eColor, 0, 1, 0, 4};
+        command.Handle().clearColorImage(native.backing.image,
+                                         vk::ImageLayout::eTransferDstOptimal,
+                                         expansion_clear, expansion_range);
+        texture_cache.MarkGpuWritten(expansion_source_id);
+        ForEachCapacityWord(
+            expansion_source.info,
+            [&](uint64_t word, uint32_t, uint32_t, uint32_t, uint32_t) {
+              expansion_shadow[word] = expansion_value;
+            });
+        auto expansion_request = expansion_source;
+        expansion_request.info.data.size *= 2;
+        expansion_request.info.resources.levels = 2;
+        expansion_request.view_info.level_count = 2;
+        expansion_request.info.UpdateSize();
+        std::vector<u32> expansion_expected(20);
+        ForEachCapacityWord(expansion_request.info, [&](uint64_t word,
+                                                        uint32_t mip,
+                                                        uint32_t layer,
+                                                        uint32_t y,
+                                                        uint32_t x) {
+          expansion_expected[mip == 0 ? layer * 4 + y * 2 + x : 16 + layer] =
+              expansion_shadow[word];
+        });
+        const auto expansion_id = texture_cache.FindImage(expansion_request);
+        (void)texture_cache.FindTexture(expansion_id, expansion_request);
+        const auto &expanded = texture_cache.GetImage(expansion_id);
+        Require(name, "same-format expansion ownership",
+                expansion_id != expansion_source_id &&
+                    expanded.backing.mip_levels == 2 &&
+                    expanded.IsGpuModified() && expanded.IsTracked(),
+                "byte-preserving expansion lost capacity, GPU ownership or CPU "
+                "tracking");
+        Require(name, "expansion oracle covers old and new bytes",
+                std::ranges::find(expansion_expected, expansion_value) !=
+                        expansion_expected.end() &&
+                    std::ranges::find(expansion_expected, 0x12345678u) !=
+                        expansion_expected.end(),
+                "expansion fixture did not cover both GPU and untouched guest "
+                "bytes");
+        auto expansion_copies = reverse_copies;
+        expansion_copies[0].imageSubresource.layerCount = 4;
+        expansion_copies[1].bufferOffset = 16 * sizeof(u32);
+        expansion_copies[1].imageSubresource.layerCount = 4;
+        auto expansion_readback = CreateHostBuffer(
+            name, 20 * sizeof(u32), vk::BufferUsageFlagBits::eTransferDst,
+            std::vector<u32>(20));
+        texture_cache.GetImage(expansion_id)
+            .Download(expansion_copies, expansion_readback.buffer, 0,
+                      expansion_readback.size);
+        HostReadBarrier(expansion_readback.buffer, expansion_readback.size,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        Require(name, "same-format mip expansion preserves guest bytes",
+                ReadBuffer(name, expansion_readback, 20) == expansion_expected,
+                "native mip expansion relocated GPU bytes within guest memory");
+        DestroyBuffer(&expansion_readback);
+      }
       const std::array<std::array<float, 4>, 2> expected_ms_depth{{
           {0x2000 / 65535.0f, 0xe000 / 65535.0f, 0.0f, 0.0f},
           {0.0f, 0x4000 / 65535.0f, 0x8000 / 65535.0f, 1.0f},

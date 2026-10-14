@@ -1019,12 +1019,45 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	RefreshCopySource(source_id);
+	const auto& source_info         = m_slot_images[source_id].info;
+	const bool  source_gpu_modified = m_slot_images[source_id].IsGpuModified();
+	bool        remapped            = false;
+	if (source_info.data.address == info.data.address && source_info.extent == info.extent &&
+	    source_info.type == info.type && source_info.resources != info.resources) {
+		const bool multiple_slices =
+		    source_info.resources.layers > 1 || source_info.extent.depth > 1;
+		remapped =
+		    source_info.tile_mode != info.tile_mode ||
+		    (multiple_slices && (source_info.linear_slice_stride != info.linear_slice_stride ||
+			                     source_info.tiled_slice_stride != info.tiled_slice_stride));
+		const auto levels = std::min(source_info.resources.levels, info.resources.levels);
+		for (uint32_t level = 0; level < levels; ++level) {
+			const auto& old_mip = source_info.mip_layout[level];
+			const auto& new_mip = info.mip_layout[level];
+			remapped |= old_mip.offset != new_mip.offset || old_mip.pitch != new_mip.pitch ||
+			            old_mip.height != new_mip.height || old_mip.tail_x != new_mip.tail_x ||
+			            old_mip.tail_y != new_mip.tail_y || old_mip.surface_z != new_mip.surface_z;
+		}
+	}
+	// A native mip copy is valid only while the guest placement is unchanged.
+	// Publish before inserting the replacement so its upload sees current bytes.
+	if (remapped && m_slot_images[source_id].SafeToDownload() &&
+	    !PublishImageToBuffer(m_slot_images[source_id])) {
+		EXIT("TextureCache: cannot preserve guest layout during image expansion\n");
+	}
 	const auto expanded_id = InsertImage(info);
 	auto&      source      = m_slot_images[source_id];
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
 	}
 	InitializeImage(expanded_id);
+	if (remapped) {
+		if (source_gpu_modified) {
+			m_slot_images[expanded_id].MarkGpuModified();
+		}
+		FreeImage(source_id);
+		return expanded_id;
+	}
 	const int32_t mip = source.info.MipOf(info);
 	const int32_t layer = source.info.SliceOf(info, mip);
 	if (layer >= 0) {
