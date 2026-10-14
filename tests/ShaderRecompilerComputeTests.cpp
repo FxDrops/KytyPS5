@@ -7984,10 +7984,10 @@ public:
       (void)texture_cache.FindDepthTarget(capacity_result, capacity_request);
 
       constexpr uint64_t color_capacity_offset = 0x2d00000;
-      std::vector<u32> color_capacity_guest(layered_guest_size / sizeof(u32),
-                                            std::bit_cast<u32>(0.125f));
+      std::vector<u32> color_capacity_guest(
+          4 * layered_guest_size / sizeof(u32), std::bit_cast<u32>(0.125f));
       std::memcpy(memory + color_capacity_offset, color_capacity_guest.data(),
-                  layered_guest_size);
+                  color_capacity_guest.size() * sizeof(u32));
       auto color_capacity_source = layered_color;
       color_capacity_source.info.data.address = base + color_capacity_offset;
       const auto color_capacity_source_id =
@@ -8022,7 +8022,8 @@ public:
                 const auto word = copy.bufferOffset / sizeof(u32) +
                                   (uint64_t{layer} * rows + y) * pitch + x;
                 Require(name, "color capacity guest bounds",
-                        word < color_capacity_guest.size(),
+                        word < color_capacity_guest.size() &&
+                            word < layout.data.size / sizeof(u32),
                         "capacity test exceeded its guest allocation");
                 visit(word, copy.imageSubresource.mipLevel,
                       copy.imageSubresource.baseArrayLayer + layer, y, x);
@@ -8810,6 +8811,93 @@ public:
           ReadBuffer(name, mixed_format_readback, 16) == mixed_format_expected,
           "compatible-format reshape converted or lost GPU-written guest bits");
       DestroyBuffer(&mixed_format_readback);
+      auto growth_source_id = mixed_format_id;
+      auto growth_source_desc = mixed_format_request;
+      for (const bool grow_layers : {false, true}) {
+        auto &growth_source = texture_cache.GetImage(growth_source_id);
+        growth_source.Transit(vk::ImageLayout::eTransferDstOptimal,
+                              vk::AccessFlagBits2::eTransferWrite, {},
+                              command.Handle());
+        const u32 growth_value =
+            std::bit_cast<u32>(grow_layers ? 0.96875f : 0.9375f);
+        capacity_clear.uint32[0] = growth_value;
+        const vk::ImageSubresourceRange growth_range{
+            vk::ImageAspectFlagBits::eColor, 0,
+            growth_source_desc.info.resources.levels, 0,
+            growth_source_desc.info.resources.layers};
+        command.Handle().clearColorImage(growth_source.backing.image,
+                                         vk::ImageLayout::eTransferDstOptimal,
+                                         capacity_clear, growth_range);
+        texture_cache.MarkGpuWritten(growth_source_id);
+        ForEachCapacityWord(
+            growth_source_desc.info,
+            [&](uint64_t word, uint32_t, uint32_t, uint32_t, uint32_t) {
+              color_capacity_guest[word] = growth_value;
+            });
+        auto growth_request = growth_source_desc;
+        growth_request.info.data.size *= 2;
+        growth_request.info.resources.levels = 2;
+        if (grow_layers) {
+          growth_request.info.resources.layers *= 2;
+        }
+        growth_request.info.pixel_format =
+            grow_layers ? vk::Format::eR32Uint : vk::Format::eR32Sfloat;
+        growth_request.info.guest_format =
+            grow_layers ? Prospero::BufferFormat::k32UInt
+                        : Prospero::BufferFormat::k32Float;
+        growth_request.view_info.format = growth_request.info.pixel_format;
+        growth_request.view_info.level_count = 2;
+        growth_request.view_info.layer_count =
+            growth_request.info.resources.layers;
+        growth_request.info.UpdateSize();
+        const uint32_t growth_layers = growth_request.info.resources.layers;
+        const uint32_t growth_words = growth_layers * 5;
+        std::vector<u32> growth_expected(growth_words);
+        ForEachCapacityWord(
+            growth_request.info, [&](uint64_t word, uint32_t mip,
+                                     uint32_t layer, uint32_t y, uint32_t x) {
+              growth_expected[mip == 0 ? layer * 4 + y * 2 + x
+                                       : growth_layers * 4 + layer] =
+                  color_capacity_guest[word];
+            });
+        Require(name, "growth oracle includes GPU writes",
+                std::ranges::find(growth_expected, growth_value) !=
+                    growth_expected.end(),
+                "growth oracle did not cover any native-written guest bytes");
+        const auto growth_id = texture_cache.FindImage(growth_request);
+        Require(name, "format-change mip growth capacity",
+                growth_id != growth_source_id &&
+                    texture_cache.GetImage(growth_id).backing.mip_levels == 2 &&
+                    texture_cache.GetImage(growth_id).backing.layers ==
+                        growth_layers,
+                "format-change growth did not allocate the required mip/layer "
+                "capacity");
+        (void)texture_cache.FindTexture(growth_id, growth_request);
+        auto growth_copies = reverse_copies;
+        growth_copies[0].imageSubresource.layerCount = growth_layers;
+        growth_copies[1].bufferOffset = growth_layers * 4 * sizeof(u32);
+        growth_copies[1].imageSubresource.layerCount = growth_layers;
+        auto growth_readback =
+            CreateHostBuffer(name, growth_words * sizeof(u32),
+                             vk::BufferUsageFlagBits::eTransferDst,
+                             std::vector<u32>(growth_words));
+        texture_cache.GetImage(growth_id).Download(
+            growth_copies, growth_readback.buffer, 0, growth_readback.size);
+        HostReadBarrier(growth_readback.buffer, growth_readback.size,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        Require(name,
+                grow_layers ? "format-change layer growth preserves guest bytes"
+                            : "format-change mip growth preserves guest bytes",
+                ReadBuffer(name, growth_readback, growth_words) ==
+                    growth_expected,
+                "capacity replacement discarded GPU contents or changed "
+                "guest-byte mapping");
+        DestroyBuffer(&growth_readback);
+        growth_source_id = growth_id;
+        growth_source_desc = growth_request;
+      }
       const std::array<std::array<float, 4>, 2> expected_ms_depth{{
           {0x2000 / 65535.0f, 0xe000 / 65535.0f, 0.0f, 0.0f},
           {0.0f, 0x4000 / 65535.0f, 0x8000 / 65535.0f, 1.0f},

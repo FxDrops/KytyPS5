@@ -1401,7 +1401,15 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 					EXIT("TextureCache: cannot publish exact-format alias contents\n");
 				}
 				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
+			} else if (resolved.info.resources.levels < desc.info.resources.levels ||
+			           resolved.info.resources.layers < desc.info.resources.layers) {
+				if (resolved.IsMaybeCpuDirty()) {
+					TrackImage(result);
+					(void)resolved.ResolveMaybeCpuHash(resolved.HashGuestEdges());
+				}
+				if (resolved.SafeToDownload() && !PublishImageToBuffer(resolved)) {
+					EXIT("TextureCache: cannot publish undersized image contents\n");
+				}
 				FreeImage(result);
 				result = {};
 			}
