@@ -502,9 +502,9 @@ void TextureCache::PrepareImageCopy(Image& image) {
 	}
 }
 
-void TextureCache::RefreshCopySource(ImageId id) {
+void TextureCache::RefreshCopySource(ImageId id, ImageId pending_destination) {
 	auto& image = m_slot_images[id];
-	RefreshImage(id);
+	RefreshImage(id, pending_destination);
 	if (image.IsDefinitelyCpuDirty()) {
 		EXIT("TextureCache: image copy source remained CPU-dirty after refresh\n");
 	}
@@ -586,7 +586,7 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 }
 
 void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
-	RefreshCopySource(source_id);
+	RefreshCopySource(source_id, destination_id);
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
 	TrackImage(destination_id);
@@ -627,7 +627,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 
 void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
                                 uint32_t layer) {
-	RefreshCopySource(source_id);
+	RefreshCopySource(source_id, destination_id);
 	if (m_slot_images[destination_id].IsBufferModified()) {
 		RefreshImage(destination_id);
 	}
@@ -765,10 +765,7 @@ bool TextureCache::PublishImageToBuffer(Image& image) {
 		     FindImagesInRegion(image.info.data.address, image.info.data.size, false)) {
 			auto& alias = m_slot_images[candidate];
 			if (&alias == &image || alias.depth_id || alias.info.HasStencil() ||
-			    alias.info.HasMetadata() || alias.info.pitch != image.info.pitch ||
-			    alias.info.mip_layout != image.info.mip_layout ||
-			    !SameBacking(alias.info, image.info, false) ||
-			    !SameBacking(image.info, alias.info, false)) {
+			    alias.info.HasMetadata() || !CanDownload(alias)) {
 				continue;
 			}
 			if (alias.SafeToDownload()) {
@@ -783,8 +780,8 @@ bool TextureCache::PublishImageToBuffer(Image& image) {
 	DownloadImage(image, *buffer, offset, image.info.data.size, image.info.resources.levels);
 	image.ClearGpuModified();
 	image.MarkBufferModified();
-	// Publication supersedes every matching copy, regardless of which lookup
-	// triggered it. Unused aliases must not retain their earlier native contents.
+	// Publication supersedes overlapping copies even when their layouts differ.
+	// Bytes outside the published range remain in the preserved buffer backing.
 	for (const auto alias: aliases) {
 		m_slot_images[alias].MarkBufferModified();
 	}
@@ -1223,7 +1220,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	}
 }
 
-void TextureCache::RefreshImage(ImageId id) {
+void TextureCache::RefreshImage(ImageId id, ImageId pending_destination) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id &&
 	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
@@ -1234,28 +1231,35 @@ void TextureCache::RefreshImage(ImageId id) {
 	if (image.IsMaybeCpuDirty()) {
 		(void)image.ResolveMaybeCpuHash(image.HashGuestEdges());
 	}
-	if (!image.depth_id && !image.info.HasStencil() && !image.info.HasMetadata()) {
-		ImageId  writer {};
+	if (!image.depth_id && !image.info.HasStencil() && !image.info.HasMetadata() &&
+	    CanDownload(image)) {
+		ImageIds writers;
 		for (const auto candidate:
 		     FindImagesInRegion(image.info.data.address, image.info.data.size, false)) {
 			auto& alias = m_slot_images[candidate];
-			if (candidate == id || alias.depth_id || alias.info.HasStencil() ||
-			    alias.info.HasMetadata() || alias.info.pitch != image.info.pitch ||
-			    alias.info.mip_layout != image.info.mip_layout ||
-			    !SameBacking(alias.info, image.info, false) ||
-			    !SameBacking(image.info, alias.info, false)) {
+			// A merge destination may already contain earlier child mips, but it
+			// cannot supersede the source that is about to be copied into it.
+			if (candidate == id || candidate == pending_destination || alias.depth_id ||
+			    alias.info.HasStencil() || alias.info.HasMetadata() || !CanDownload(alias)) {
 				continue;
 			}
 			if (alias.SafeToDownload()) {
-				if (writer || image.SafeToDownload()) {
-					EXIT("TextureCache: conflicting native writers for equal-layout aliases\n");
+				if (image.SafeToDownload()) {
+					EXIT("TextureCache: conflicting native writers for overlapping aliases "
+					     "[%llx + %llu, format %u] [%llx + %llu, format %u]\n",
+					     static_cast<unsigned long long>(image.info.data.address),
+					     static_cast<unsigned long long>(image.info.data.size),
+					     static_cast<unsigned>(image.info.pixel_format),
+					     static_cast<unsigned long long>(alias.info.data.address),
+					     static_cast<unsigned long long>(alias.info.data.size),
+					     static_cast<unsigned>(alias.info.pixel_format));
 				}
-				writer = candidate;
+				writers.push_back(candidate);
 			}
 		}
-		if (writer) {
+		for (const auto writer: writers) {
 			if (!PublishImageToBuffer(m_slot_images[writer])) {
-				EXIT("TextureCache: cannot publish existing format alias contents\n");
+				EXIT("TextureCache: cannot publish existing overlapping alias contents\n");
 			}
 		}
 	}

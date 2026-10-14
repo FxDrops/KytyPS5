@@ -10011,6 +10011,73 @@ public:
                     std::vector<u32>(4, aged_value),
                 "overlap resolution discarded authoritative GPU bytes");
         DestroyBuffer(&aged_readback);
+        if (retain) {
+          // Make both cached copies clean before the smaller alias is written.
+          (void)texture_cache.FindTexture(aged_id, aged_desc);
+          interior.Transit(vk::ImageLayout::eTransferDstOptimal,
+                           vk::AccessFlagBits2::eTransferWrite, {},
+                           command.Handle());
+          constexpr u32 interior_value = 0x13579bdfu;
+          aged_clear.uint32[0] = interior_value;
+          command.Handle().clearColorImage(interior.backing.image,
+                                           vk::ImageLayout::eTransferDstOptimal,
+                                           &aged_clear, 1, &aged_range);
+          texture_cache.MarkGpuWritten(interior_id);
+          const auto reused_id = texture_cache.FindImage(aged_desc);
+          Require(name, "partial alias cache hit", reused_id == aged_id,
+                  "partial alias test did not reuse the larger backing");
+          (void)texture_cache.FindTexture(reused_id, aged_desc);
+          auto outer_readback =
+              CreateHostBuffer(name, 64, vk::BufferUsageFlagBits::eTransferDst,
+                               std::vector<u32>(16));
+          auto outer_copy = aged_copy;
+          outer_copy.imageExtent = {4, 4, 1};
+          texture_cache.GetImage(reused_id).Download(
+              std::span{&outer_copy, 1}, outer_readback.buffer, 0, 64);
+          HostReadBarrier(outer_readback.buffer, outer_readback.size,
+                          vk::PipelineStageFlagBits::eTransfer,
+                          vk::AccessFlagBits::eTransferWrite);
+          scheduler.Finish();
+          std::vector<u32> outer_expected(16, aged_value);
+          std::fill(outer_expected.begin() + 1, outer_expected.begin() + 5,
+                    interior_value);
+          Require(name, "partial alias cache-hit freshness",
+                  ReadBuffer(name, outer_readback, 16) == outer_expected,
+                  "larger cached image missed GPU writes through its interior "
+                  "alias");
+          auto second_desc = interior_desc;
+          second_desc.info.data.address = base + aged_offset + 36;
+          const auto second_id = texture_cache.FindImage(second_desc);
+          (void)texture_cache.FindTexture(second_id, second_desc);
+          const std::array writer_ids{interior_id, second_id};
+          constexpr std::array<u32, 2> writer_values{0x2468ace0u, 0x10203040u};
+          for (size_t writer = 0; writer < writer_ids.size(); ++writer) {
+            auto &native = texture_cache.GetImage(writer_ids[writer]);
+            native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                           vk::AccessFlagBits2::eTransferWrite, {},
+                           command.Handle());
+            aged_clear.uint32[0] = writer_values[writer];
+            command.Handle().clearColorImage(
+                native.backing.image, vk::ImageLayout::eTransferDstOptimal,
+                &aged_clear, 1, &aged_range);
+            texture_cache.MarkGpuWritten(writer_ids[writer]);
+            std::fill(outer_expected.begin() + 1 + writer * 8,
+                      outer_expected.begin() + 5 + writer * 8,
+                      writer_values[writer]);
+          }
+          (void)texture_cache.FindTexture(reused_id, aged_desc);
+          texture_cache.GetImage(reused_id).Download(
+              std::span{&outer_copy, 1}, outer_readback.buffer, 0, 64);
+          HostReadBarrier(outer_readback.buffer, outer_readback.size,
+                          vk::PipelineStageFlagBits::eTransfer,
+                          vk::AccessFlagBits::eTransferWrite);
+          scheduler.Finish();
+          Require(
+              name, "disjoint partial alias writers",
+              ReadBuffer(name, outer_readback, 16) == outer_expected,
+              "publishing disjoint writers lost modified or untouched bytes");
+          DestroyBuffer(&outer_readback);
+        }
       }
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
