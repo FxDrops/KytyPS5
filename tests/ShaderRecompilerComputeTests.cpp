@@ -41004,6 +41004,52 @@ void CheckAttachmentPassDependencies(RenderContext &renderer) {
   std::printf("[gpu]     %-32s ok\n", name);
 }
 
+VKAPI_ATTR void VKAPI_CALL RejectInvalidMipCopyDispatch(VkCommandBuffer,
+                                                        VkImage, VkImageLayout,
+                                                        VkImage, VkImageLayout,
+                                                        uint32_t,
+                                                        const VkImageCopy *) {
+  std::puts("invalid mip copy reached Vulkan dispatch");
+  std::fflush(stdout);
+  std::_Exit(0);
+}
+
+void CheckInvalidMipCopy(RenderContext &renderer, const char *test_case) {
+  auto &graphics = renderer.GetGraphics();
+  CommandScheduler scheduler(renderer, graphics);
+  HW::Context registers{};
+  HW::UserConfig user_config{};
+  HW::Shader shaders{};
+  scheduler.Begin(registers, user_config, shaders);
+  ImageInfo source_info{};
+  source_info.pixel_format = vk::Format::eR8Unorm;
+  source_info.guest_format = Prospero::BufferFormat::k8UNorm;
+  source_info.extent = {2, 2, 1};
+  source_info.pitch = 2;
+  source_info.bytes_per_block = 1;
+  auto destination_info = source_info;
+  uint32_t layer = 0;
+  if (std::strcmp(test_case, "layers") == 0) {
+    source_info.resources.layers = 2;
+    destination_info.resources.layers = 2;
+    layer = 1;
+  } else {
+    Require("InvalidMipCopy", "case", std::strcmp(test_case, "depth") == 0,
+            "unknown mip-copy death test case");
+    source_info.type = destination_info.type = Prospero::ImageType::kColor3D;
+    destination_info.extent.depth = 2;
+  }
+  Image source(graphics, scheduler, source_info);
+  Image destination(graphics, scheduler, destination_info);
+  // Never submit the intentionally invalid region to the driver, even before
+  // the production guard exists. Reaching dispatch must fail the death test.
+  VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdCopyImage = RejectInvalidMipCopyDispatch;
+  std::printf("invalid mip copy reached: %s\n", test_case);
+  std::fflush(stdout);
+  destination.CopyMip(source, 0, layer);
+  std::_Exit(0);
+}
+
 void CheckImageTransitionState(RenderContext &renderer) {
   CheckAttachmentPassDependencies(renderer);
   constexpr const char *name = "ImageTransitionState";
@@ -41212,7 +41258,8 @@ void CheckImageTransitionState(RenderContext &renderer) {
   source_info.stencil = {0x1000, 4};
   auto destination_info = depth_info;
   destination_info.resources.levels = 2;
-  destination_info.stencil = {0x2000, 16};
+  destination_info.resources.layers = 2;
+  destination_info.stencil = {0x2000, 32};
   Image source(context, scheduler, source_info);
   Image destination(context, scheduler, destination_info);
   StreamBuffer upload(context, scheduler, MemoryUsage::Upload, 4096);
@@ -41237,7 +41284,7 @@ void CheckImageTransitionState(RenderContext &renderer) {
                                        1};
   source_copies[1].imageExtent = {2, 2, 1};
   source.Upload(source_copies, upload.Handle(), upload_offset, 128);
-  destination.CopyMip(source, 1, 0);
+  destination.CopyMip(source, 1, 1);
 
   const auto [download_data, download_offset] = download.Map(128, 4);
   Require(name, "depth/stencil download map", download_data != nullptr,
@@ -41246,8 +41293,10 @@ void CheckImageTransitionState(RenderContext &renderer) {
   auto destination_copies = source_copies;
   destination_copies[0].bufferOffset = download_offset;
   destination_copies[0].imageSubresource.mipLevel = 1;
+  destination_copies[0].imageSubresource.baseArrayLayer = 1;
   destination_copies[1].bufferOffset = download_offset + 64;
   destination_copies[1].imageSubresource.mipLevel = 1;
+  destination_copies[1].imageSubresource.baseArrayLayer = 1;
   destination.Download(destination_copies, download.Handle(), download_offset,
                        128);
 
@@ -45916,6 +45965,11 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--image-upload-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckLargeSparseImageUpload();
+    return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--mip-copy-death") == 0) {
+    VulkanHarness vulkan;
+    CheckInvalidMipCopy(vulkan.RuntimeRenderer(), argv[2]);
     return 0;
   }
   if (argc == 3 && std::strcmp(argv[1], "--depth-alias-death") == 0) {

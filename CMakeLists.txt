@@ -676,6 +676,13 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-layout-only)
 	add_test(NAME image_transition_state
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-transition-only)
+	foreach(copy_case layers depth)
+		add_test(NAME image_mip_copy_bounds_${copy_case}
+			COMMAND ${CMAKE_COMMAND}
+				-DTEST_EXECUTABLE=$<TARGET_FILE:shader_recompiler_compute_tests>
+				-DCOPY_CASE=${copy_case}
+				-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/MipCopyDeath.cmake)
+	endforeach()
 
 	add_test(NAME texture_cache_layered_image
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --layered-image-only)
