@@ -485,6 +485,53 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
                                                        BufferId id) {
 	if (is_written) {
 		m_texture_cache.PrepareBufferWrite(vaddr, size);
+	} else if (is_texel_buffer) {
+		if (!GuestRange {vaddr, size}.Valid() || m_scheduler.Current().IsInvalid()) {
+			EXIT("BufferCache: image read requires a valid range and command buffer\n");
+		}
+		std::scoped_lock     lock {m_texture_cache.m_lock};
+		std::vector<ImageId> sources;
+		auto                 begin = vaddr;
+		auto                 end   = vaddr + size;
+		for (const auto candidate: m_texture_cache.FindImagesInRegion(vaddr, size, false)) {
+			auto& image = m_texture_cache.m_slot_images[candidate];
+			if (image.depth_id) {
+				continue;
+			}
+			if (image.IsMaybeCpuDirty()) {
+				m_texture_cache.TrackImage(candidate);
+				(void)image.ResolveMaybeCpuHash(image.HashGuestEdges());
+			}
+			if (!image.SafeToDownload()) {
+				continue;
+			}
+			if (!m_texture_cache.CanDownload(image)) {
+				EXIT("BufferCache: cannot read native image through overlapping buffer\n");
+			}
+			for (const auto source: sources) {
+				if (m_texture_cache.m_slot_images[source].Overlaps(image.info.data.address,
+				                                                   image.info.data.size)) {
+					EXIT("BufferCache: conflicting native image writers during buffer read\n");
+				}
+			}
+			sources.push_back(candidate);
+			begin = std::min(begin, image.info.data.address);
+			end   = std::max(end, image.info.data.End());
+		}
+		if (!sources.empty()) {
+			// Download complete guest layouts, including strided array slices, before
+			// exposing the requested subrange. A read keeps native image ownership.
+			id           = FindBuffer(begin, end - begin);
+			auto& buffer = m_slot_buffers[id];
+			TouchBuffer(buffer);
+			(void)SynchronizeBuffer(buffer, begin, end - begin, false, false);
+			for (const auto source: sources) {
+				auto& image = m_texture_cache.m_slot_images[source];
+				m_texture_cache.DownloadImage(image, buffer, buffer.Offset(image.info.data.address),
+				                              image.info.data.size, image.info.resources.levels);
+			}
+			return {&buffer, buffer.Offset(vaddr)};
+		}
 	}
 	return ObtainBufferImpl(vaddr, size, is_written, is_texel_buffer, id);
 }

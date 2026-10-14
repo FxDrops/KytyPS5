@@ -7162,6 +7162,50 @@ public:
         }
       }
 
+      // Image-synchronized buffer reads must also see interior native writes.
+      for (const uint32_t read_offset : {12u, 0u}) {
+        const uint32_t expected = 0x76543210u + read_offset;
+        vk::ClearValue painted{};
+        painted.color.uint32 = std::array{expected, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(
+            texture_cache, scheduler.Current(), buffer_alias_image,
+            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+        auto readable = resources.GetBufferCache().ObtainBuffer(
+            buffer_alias_desc.info.data.address + read_offset, sizeof(uint32_t),
+            false, true);
+        Require(name, "partial image buffer read allocation",
+                readable.first != nullptr,
+                "image buffer read allocation failed");
+        auto readback = CreateHostBuffer(
+            name, sizeof(uint32_t), vk::BufferUsageFlagBits::eTransferDst, {0});
+        const vk::MemoryBarrier ready{
+            .srcAccessMask = vk::AccessFlagBits::eMemoryWrite,
+            .dstAccessMask = vk::AccessFlagBits::eTransferRead};
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eAllCommands,
+            vk::PipelineStageFlagBits::eTransfer, {}, 1, &ready, 0, nullptr, 0,
+            nullptr);
+        const vk::BufferCopy copy{readable.second, 0, sizeof(uint32_t)};
+        scheduler.Current().Handle().copyBuffer(readable.first->Handle(),
+                                                readback.buffer, 1, &copy);
+        HostReadBarrier(readback.buffer, readback.size,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        Require(
+            name,
+            read_offset == 0 ? "exact-base image buffer read"
+                             : "interior image buffer read",
+            ReadBuffer(name, readback, 1) == std::vector<u32>{expected},
+            "buffer read returned stale bytes instead of native image data");
+        Require(
+            name, "partial image buffer read ownership",
+            texture_cache.GetImage(buffer_alias_image).IsGpuModified() &&
+                !texture_cache.GetImage(buffer_alias_image).IsBufferModified(),
+            "read-only buffer acquisition transferred image ownership");
+        DestroyBuffer(&readback);
+      }
+
       constexpr uint64_t exact_buffer_offset = 0x90000;
       constexpr uint32_t exact_buffer_value = 0x3f234567u;
       std::memcpy(memory + exact_buffer_offset, &exact_buffer_value,
