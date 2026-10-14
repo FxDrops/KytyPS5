@@ -768,6 +768,10 @@ bool TextureCache::PublishImageToBuffer(Image& image) {
 			    alias.info.HasMetadata() || !CanDownload(alias)) {
 				continue;
 			}
+			if (alias.IsMaybeCpuDirty()) {
+				TrackImage(candidate);
+				(void)alias.ResolveMaybeCpuHash(alias.HashGuestEdges());
+			}
 			if (alias.SafeToDownload()) {
 				EXIT("TextureCache: conflicting native writers during alias publication\n");
 			}
@@ -1242,6 +1246,10 @@ void TextureCache::RefreshImage(ImageId id, ImageId pending_destination) {
 			if (candidate == id || candidate == pending_destination || alias.depth_id ||
 			    alias.info.HasStencil() || alias.info.HasMetadata() || !CanDownload(alias)) {
 				continue;
+			}
+			if (alias.IsMaybeCpuDirty()) {
+				TrackImage(candidate);
+				(void)alias.ResolveMaybeCpuHash(alias.HashGuestEdges());
 			}
 			if (alias.SafeToDownload()) {
 				if (image.SafeToDownload()) {

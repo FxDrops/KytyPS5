@@ -10050,32 +10050,57 @@ public:
           const auto second_id = texture_cache.FindImage(second_desc);
           (void)texture_cache.FindTexture(second_id, second_desc);
           const std::array writer_ids{interior_id, second_id};
-          constexpr std::array<u32, 2> writer_values{0x2468ace0u, 0x10203040u};
-          for (size_t writer = 0; writer < writer_ids.size(); ++writer) {
-            auto &native = texture_cache.GetImage(writer_ids[writer]);
-            native.Transit(vk::ImageLayout::eTransferDstOptimal,
-                           vk::AccessFlagBits2::eTransferWrite, {},
-                           command.Handle());
-            aged_clear.uint32[0] = writer_values[writer];
-            command.Handle().clearColorImage(
-                native.backing.image, vk::ImageLayout::eTransferDstOptimal,
-                &aged_clear, 1, &aged_range);
-            texture_cache.MarkGpuWritten(writer_ids[writer]);
-            std::fill(outer_expected.begin() + 1 + writer * 8,
-                      outer_expected.begin() + 5 + writer * 8,
-                      writer_values[writer]);
+          for (const bool neighboring_cpu_write : {false, true}) {
+            const std::array<u32, 2> writer_values =
+                neighboring_cpu_write
+                    ? std::array<u32, 2>{0x76543210u, 0xfedcba98u}
+                    : std::array<u32, 2>{0x2468ace0u, 0x10203040u};
+            for (size_t writer = 0; writer < writer_ids.size(); ++writer) {
+              auto &native = texture_cache.GetImage(writer_ids[writer]);
+              native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                             vk::AccessFlagBits2::eTransferWrite, {},
+                             command.Handle());
+              aged_clear.uint32[0] = writer_values[writer];
+              command.Handle().clearColorImage(
+                  native.backing.image, vk::ImageLayout::eTransferDstOptimal,
+                  &aged_clear, 1, &aged_range);
+              texture_cache.MarkGpuWritten(writer_ids[writer]);
+              std::fill(outer_expected.begin() + 1 + writer * 8,
+                        outer_expected.begin() + 5 + writer * 8,
+                        writer_values[writer]);
+            }
+            if (neighboring_cpu_write) {
+              texture_cache.InvalidateMemory(base + aged_offset + 128, 1);
+              for (const auto writer_id : writer_ids) {
+                const auto &writer = texture_cache.GetImage(writer_id);
+                Require(name, "neighboring CPU write marks aliases uncertain",
+                        writer.IsMaybeCpuDirty() && !writer.IsTracked(),
+                        "neighboring invalidation did not exercise uncertain "
+                        "ownership");
+              }
+            }
+            (void)texture_cache.FindTexture(reused_id, aged_desc);
+            texture_cache.GetImage(reused_id).Download(
+                std::span{&outer_copy, 1}, outer_readback.buffer, 0, 64);
+            HostReadBarrier(outer_readback.buffer, outer_readback.size,
+                            vk::PipelineStageFlagBits::eTransfer,
+                            vk::AccessFlagBits::eTransferWrite);
+            scheduler.Finish();
+            Require(
+                name,
+                neighboring_cpu_write ? "uncertain partial alias writers"
+                                      : "disjoint partial alias writers",
+                ReadBuffer(name, outer_readback, 16) == outer_expected,
+                "publishing disjoint writers lost modified or untouched bytes");
+            if (neighboring_cpu_write) {
+              for (const auto writer_id : writer_ids) {
+                const auto &writer = texture_cache.GetImage(writer_id);
+                Require(name, "resolved alias tracking restored",
+                        !writer.IsMaybeCpuDirty() && writer.IsTracked(),
+                        "resolved alias lost its CPU write protection");
+              }
+            }
           }
-          (void)texture_cache.FindTexture(reused_id, aged_desc);
-          texture_cache.GetImage(reused_id).Download(
-              std::span{&outer_copy, 1}, outer_readback.buffer, 0, 64);
-          HostReadBarrier(outer_readback.buffer, outer_readback.size,
-                          vk::PipelineStageFlagBits::eTransfer,
-                          vk::AccessFlagBits::eTransferWrite);
-          scheduler.Finish();
-          Require(
-              name, "disjoint partial alias writers",
-              ReadBuffer(name, outer_readback, 16) == outer_expected,
-              "publishing disjoint writers lost modified or untouched bytes");
           DestroyBuffer(&outer_readback);
         }
       }
