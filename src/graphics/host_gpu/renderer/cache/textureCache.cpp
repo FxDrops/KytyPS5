@@ -779,8 +779,9 @@ bool TextureCache::PublishImageToBuffer(Image& image) {
 		}
 	}
 	// Preserve guest padding before overlaying the native GPU image contents.
-	auto [buffer, offset] =
-	    m_buffer_cache.ObtainBuffer(image.info.data.address, image.info.data.size, true);
+	// Ownership is already held here; do not recursively prepare this image write.
+	auto [buffer, offset] = m_buffer_cache.ObtainBufferImpl(image.info.data.address,
+	                                                        image.info.data.size, true, false, {});
 	DownloadImage(image, *buffer, offset, image.info.data.size, image.info.resources.levels);
 	image.ClearGpuModified();
 	image.MarkBufferModified();
@@ -1995,16 +1996,33 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	return true;
 }
 
+void TextureCache::PrepareBufferWrite(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid() || m_scheduler.Current().IsInvalid()) {
+		EXIT("TextureCache: buffer write preparation requires a valid range and command buffer\n");
+	}
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		auto& image = m_slot_images[id];
+		if (image.depth_id) {
+			continue;
+		}
+		if (image.IsMaybeCpuDirty()) {
+			TrackImage(id);
+			(void)image.ResolveMaybeCpuHash(image.HashGuestEdges());
+		}
+		if (image.SafeToDownload() && !PublishImageToBuffer(image)) {
+			EXIT("TextureCache: cannot preserve native image before overlapping buffer write\n");
+		}
+	}
+}
+
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
-	for (const auto id: FindImagesInRegion(address, size, true)) {
+	for (const auto id: FindImagesInRegion(address, size, false)) {
 		auto& image = m_slot_images[id];
-		if (image.info.data.address != address) {
-			continue;
-		}
 		if (image.IsGpuModified()) {
 			image.ClearGpuModified();
 		}

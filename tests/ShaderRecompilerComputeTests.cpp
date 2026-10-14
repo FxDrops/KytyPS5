@@ -7095,41 +7095,71 @@ public:
         verify_array();
       }
 
-      // A write through a separate buffer must not replace untouched image
-      // texels with stale backing bytes. Exact-base writes still refresh it.
+      // Buffer writes must update the addressed texel while retaining every
+      // other native-written image texel, including exact-base partial writes.
       constexpr uint64_t buffer_alias_offset = 0x1a00000;
       constexpr uint32_t buffer_alias_image_value = 0x13579bdfu;
       constexpr uint32_t buffer_alias_write_value = 0x2468ace0u;
       std::memset(memory + buffer_alias_offset, 0, 4 * sizeof(uint32_t));
+      constexpr uint64_t buffer_copy_offset = buffer_alias_offset + 0x1000;
+      std::memcpy(memory + buffer_copy_offset, &buffer_alias_write_value,
+                  sizeof(buffer_alias_write_value));
       auto buffer_alias_desc = MakeLinearDesc(
           base + buffer_alias_offset, 4 * sizeof(uint32_t), vk::Format::eR32Uint,
           Prospero::BufferFormat::k32UInt, Prospero::ImageType::kColor2D,
           {4, 1, 1}, 1, 4, 1);
       const auto buffer_alias_image = texture_cache.FindImage(buffer_alias_desc);
-      for (const uint32_t write_offset : {0u, 12u}) {
-        vk::ClearValue painted{};
-        painted.color.uint32 = std::array{buffer_alias_image_value, 0u, 0u, 0u};
-        TextureCacheTestAccess::ClearImage(
-            texture_cache, scheduler.Current(), buffer_alias_image,
-            {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
-        const auto write_address = buffer_alias_desc.info.data.address + write_offset;
-        auto writable = resources.GetBufferCache().ObtainBuffer(
-            write_address, sizeof(uint32_t), true, false);
-        Require(name, "image alias buffer allocation", writable.first != nullptr,
-                "failed to allocate the image alias write buffer");
-        writable.first->Fill(writable.second, sizeof(uint32_t), buffer_alias_write_value);
-        texture_cache.InvalidateMemoryFromGPU(write_address, sizeof(uint32_t));
-        (void)texture_cache.FindTexture(buffer_alias_image, buffer_alias_desc);
-        const bool exact_base = write_offset == 0;
-        const uint32_t read_texels = exact_base ? 1 : 3;
-        Require(name, exact_base ? "exact-base buffer write refresh"
-                                 : "overlapping buffer preserves untouched texels",
-                ReadCachedTexel(name, context, buffer_alias_image, {},
-                                {read_texels, 1, 1}) ==
-                    std::vector<u32>(read_texels, exact_base ? buffer_alias_write_value
-                                                           : buffer_alias_image_value),
-                exact_base ? "exact-base buffer write did not refresh the native image"
-                           : "overlapping buffer write replaced untouched GPU image texels");
+      for (const uint32_t write_method : {0u, 1u, 2u}) {
+        for (const uint32_t write_offset : {0u, 12u}) {
+          vk::ClearValue painted{};
+          painted.color.uint32 =
+              std::array{buffer_alias_image_value, 0u, 0u, 0u};
+          TextureCacheTestAccess::ClearImage(
+              texture_cache, scheduler.Current(), buffer_alias_image,
+              {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, painted);
+          const auto write_address =
+              buffer_alias_desc.info.data.address + write_offset;
+          if (write_method == 0) {
+            auto writable = resources.GetBufferCache().ObtainBuffer(
+                write_address, sizeof(uint32_t), true, false);
+            Require(name, "image alias buffer allocation",
+                    writable.first != nullptr,
+                    "failed to allocate the image alias write buffer");
+            writable.first->Fill(writable.second, sizeof(uint32_t),
+                                 buffer_alias_write_value);
+            texture_cache.InvalidateMemoryFromGPU(write_address,
+                                                  sizeof(uint32_t));
+          } else if (write_method == 1) {
+            Require(name, "buffer fill uses GPU path",
+                    resources.GetBufferCache().IsRegionGpuModified(
+                        write_address, sizeof(u32)),
+                    "buffer fill fixture did not exercise GPU writes");
+            resources.GetBufferCache().FillBuffer(
+                write_address, sizeof(u32), buffer_alias_write_value, false);
+          } else {
+            Require(name, "buffer copy uses GPU path",
+                    resources.GetBufferCache().IsRegionGpuModified(
+                        write_address, sizeof(u32)),
+                    "buffer copy fixture did not exercise GPU writes");
+            resources.GetBufferCache().CopyBuffer(write_address,
+                                                  base + buffer_copy_offset,
+                                                  sizeof(u32), false, false);
+          }
+          (void)texture_cache.FindTexture(buffer_alias_image,
+                                          buffer_alias_desc);
+          std::vector<u32> buffer_alias_expected(4, buffer_alias_image_value);
+          buffer_alias_expected[write_offset / sizeof(u32)] =
+              buffer_alias_write_value;
+          Require(name,
+                  write_method == 1   ? "partial buffer fill"
+                  : write_method == 2 ? "partial buffer copy"
+                  : write_offset == 0 ? "exact-base partial buffer write"
+                                      : "interior partial buffer write",
+                  ReadCachedTexel(name, context, buffer_alias_image, {},
+                                  {4, 1, 1}) == buffer_alias_expected,
+                  "partial buffer write lost modified or untouched GPU image "
+                  "texels");
+        }
       }
 
       constexpr uint64_t exact_buffer_offset = 0x90000;

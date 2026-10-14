@@ -145,6 +145,7 @@ private:
 	void                        InitializeImage(ImageId id);
 	[[nodiscard]] bool          CanDownload(const Image& image) const;
 	[[nodiscard]] bool          PublishImageToBuffer(Image& image);
+	void                        PrepareBufferWrite(uint64_t address, uint64_t size);
 	void UploadImage(Image& image, Buffer& source, uint64_t source_offset);
 	void DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
 	                   uint64_t destination_size, uint32_t levels);
