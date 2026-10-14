@@ -5454,7 +5454,7 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
-  void CheckUnifiedTextureCacheFlow() {
+  void CheckUnifiedTextureCacheFlow(const char *unsupported_alias = nullptr) {
     constexpr const char *name = "UnifiedTextureCacheFlow";
     constexpr uintptr_t base = 0x0000000200600000ull;
     constexpr uint64_t allocation_size = 0x3000000;
@@ -6761,6 +6761,28 @@ public:
               texture_cache.GetImage(ms_stencil_alias).backing.image == nullptr,
           "unequal-sample overlap did not run the color-to-MS-depth pass "
           "without manufacturing stencil ownership");
+      if (unsupported_alias != nullptr) {
+        auto alias = color_desc;
+        if (std::strcmp(unsupported_alias, "cross-format") == 0) {
+          alias.info.pixel_format = vk::Format::eR16Unorm;
+          alias.info.guest_format = Prospero::BufferFormat::k16UNorm;
+          alias.info.bytes_per_block = 2;
+          alias.info.samples = 2;
+          alias.view_info.format = vk::Format::eR16Unorm;
+        }
+        alias.type = BindingType::RenderTarget;
+        alias.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+        std::printf("[gpu] unsupported depth alias reached: %s\n",
+                    unsupported_alias);
+        std::fflush(stdout);
+        const auto replacement = texture_cache.FindImage(alias);
+        Require(name, "unsupported alias returned",
+                replacement && replacement != ms_depth_image,
+                "unsupported alias did not reach the replacement path");
+        std::printf("[gpu] unsupported depth alias silently replaced source\n");
+        std::fflush(stdout);
+        std::exit(0);
+      }
       auto &oversized_ms = texture_cache.GetImage(ms_depth_image);
       const auto ms_data_size = oversized_ms.info.data.size;
       oversized_ms.info.data.size = (32ull << 20) + 4;
@@ -7908,6 +7930,32 @@ public:
               texture_cache.GetImage(layered_depth_image).IsGpuModified(),
               "a CPU read invalidated layered depth GPU ownership");
 
+      // Growing the layer count must not be hidden by a smaller mip count.
+      constexpr uint64_t capacity_offset = 0x2e00000;
+      std::memcpy(memory + capacity_offset, memory + layered_offset,
+                  layered_guest_size);
+      auto capacity_source = layered_color;
+      capacity_source.info.data.address = base + capacity_offset;
+      capacity_source.type = BindingType::DepthTarget;
+      capacity_source.info.pixel_format = vk::Format::eD32Sfloat;
+      capacity_source.view_info.format = vk::Format::eD32Sfloat;
+      capacity_source.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      capacity_source.view_info.usage =
+          vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      const auto capacity_source_id = texture_cache.FindImage(capacity_source);
+      (void)texture_cache.FindDepthTarget(capacity_source_id, capacity_source);
+      texture_cache.MarkGpuWritten(capacity_source_id);
+      auto capacity_request = layered_depth;
+      capacity_request.info.data.address = base + capacity_offset;
+      const auto capacity_result = texture_cache.FindImage(capacity_request);
+      const auto &capacity_native = texture_cache.GetImage(capacity_result);
+      Require(name, "fewer mips with more depth layers",
+              capacity_result != capacity_source_id &&
+                  capacity_native.backing.layers == 4 &&
+                  capacity_native.backing.mip_levels == 1 &&
+                  capacity_native.IsGpuModified(),
+              "lexicographic mip comparison hid a missing array layer");
+
       constexpr uint64_t replacement_offset = 0x18000;
       constexpr uint64_t replacement_size = 0x2000;
       constexpr uint32_t replacement_pixel = 0xcafebabeu;
@@ -8208,6 +8256,21 @@ public:
                       vk::PipelineStageFlagBits::eTransfer,
                       vk::AccessFlagBits::eTransferWrite);
 
+      auto capacity_readback = CreateHostBuffer(
+          name, 8 * sizeof(float), vk::BufferUsageFlagBits::eTransferDst,
+          std::vector<u32>(8, 0));
+      auto &capacity_depth_native = texture_cache.GetImage(capacity_result);
+      capacity_depth_native.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                                    vk::AccessFlagBits2::eTransferRead, {},
+                                    command.Handle());
+      command.Handle().copyImageToBuffer(capacity_depth_native.backing.image,
+                                         vk::ImageLayout::eTransferSrcOptimal,
+                                         capacity_readback.buffer, 1,
+                                         &layered_copy);
+      HostReadBarrier(capacity_readback.buffer, capacity_readback.size,
+                      vk::PipelineStageFlagBits::eTransfer,
+                      vk::AccessFlagBits::eTransferWrite);
+
       vk::ShaderModuleCreateInfo module_info{};
       module_info.sType = vk::StructureType::eShaderModuleCreateInfo;
       module_info.codeSize = sizeof(GPU_TEST_MS_DEPTH_SPV);
@@ -8429,6 +8492,10 @@ public:
       }
       Require(name, "layered depth common-mip content", layered_content,
               "depth/color conversion changed a shared array-layer value");
+      Require(name, "depth layer growth preserves common mip content",
+              ReadBuffer(name, capacity_readback, 8) == layered_words,
+              "growing layers while shrinking mips lost shared depth values");
+      DestroyBuffer(&capacity_readback);
       const std::array<std::array<float, 4>, 2> expected_ms_depth{{
           {0x2000 / 65535.0f, 0xe000 / 65535.0f, 0.0f, 0.0f},
           {0.0f, 0x4000 / 65535.0f, 0x8000 / 65535.0f, 1.0f},
@@ -40561,7 +40628,145 @@ void CheckSampledDepthResource() {
   std::printf("[host]    %-32s ok\n", "SampledDepthResource");
 }
 
+struct AttachmentBarrierCapture {
+  inline static AttachmentBarrierCapture *active = nullptr;
+  PFN_vkCmdPipelineBarrier2 original;
+  VkCommandBuffer command;
+  std::vector<VkMemoryBarrier2> barriers;
+
+  explicit AttachmentBarrierCapture(vk::CommandBuffer buffer)
+      : original(VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdPipelineBarrier2),
+        command(buffer) {
+    Require("AttachmentBarrierCapture", "scope", active == nullptr,
+            "nested dispatch capture");
+    active = this;
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdPipelineBarrier2 = Capture;
+  }
+  ~AttachmentBarrierCapture() {
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdPipelineBarrier2 = original;
+    active = nullptr;
+  }
+  static VKAPI_ATTR void VKAPI_CALL Capture(VkCommandBuffer buffer,
+                                            const VkDependencyInfo *info) {
+    if (buffer == active->command) {
+      for (uint32_t i = 0; i < info->memoryBarrierCount; ++i) {
+        active->barriers.push_back(info->pMemoryBarriers[i]);
+      }
+    }
+    active->original(buffer, info);
+  }
+};
+
+void CheckAttachmentPassDependencies(RenderContext &renderer) {
+  constexpr const char *name = "AttachmentPassDependencies";
+  auto &graphics = renderer.GetGraphics();
+  CommandScheduler scheduler(renderer, graphics);
+  HW::Context registers{};
+  HW::UserConfig user_config{};
+  HW::Shader shaders{};
+  scheduler.Begin(registers, user_config, shaders);
+  for (const auto format : {vk::Format::eR32Sfloat, vk::Format::eD32Sfloat}) {
+    const bool depth = format == vk::Format::eD32Sfloat;
+    ImageInfo info{};
+    info.pixel_format = format;
+    info.guest_format = Prospero::BufferFormat::k32Float;
+    info.extent = {2, 2, 1};
+    info.pitch = 2;
+    info.bytes_per_block = 4;
+    Image image(graphics, scheduler, info);
+    const auto aspect = depth ? vk::ImageAspectFlagBits::eDepth
+                              : vk::ImageAspectFlagBits::eColor;
+    const auto layout = depth ? vk::ImageLayout::eDepthStencilAttachmentOptimal
+                              : vk::ImageLayout::eColorAttachmentOptimal;
+    const auto read = depth ? vk::AccessFlagBits2::eDepthStencilAttachmentRead
+                            : vk::AccessFlagBits2::eColorAttachmentRead;
+    const auto write = depth ? vk::AccessFlagBits2::eDepthStencilAttachmentWrite
+                             : vk::AccessFlagBits2::eColorAttachmentWrite;
+    vk::ImageViewCreateInfo view_info{};
+    view_info.image = image.backing.image;
+    view_info.viewType = vk::ImageViewType::e2D;
+    view_info.format = format;
+    view_info.subresourceRange = {aspect, 0, 1, 0, 1};
+    vk::ImageView view;
+    RequireVk(name, "view",
+              graphics.device.createImageView(&view_info, nullptr, &view),
+              "create attachment view");
+    auto &command = scheduler.Current();
+    image.Transit(layout, read | write, {}, command.Handle());
+    RenderState state{};
+    state.width = state.height = 2;
+    state.num_layers = 1;
+    if (depth) {
+      auto &attachment = state.depth_stencil_attachment;
+      attachment.image_view = view;
+      attachment.image_layout = layout;
+      attachment.has_depth = true;
+      attachment.depth_clear = true;
+      attachment.clear_value[0] = std::bit_cast<uint32_t>(0.25f);
+    } else {
+      state.num_color_attachments = 1;
+      auto &attachment = state.color_attachments[0];
+      attachment.image_view = view;
+      attachment.image_layout = layout;
+      attachment.is_clear = true;
+      attachment.clear_value[0] = std::bit_cast<uint32_t>(0.25f);
+    }
+    {
+      AttachmentBarrierCapture capture(command.Handle());
+      command.BeginRendering(state);
+      command.BeginRendering(state);
+      Require(name, "same-pass batching", capture.barriers.empty(),
+              "unchanged render state introduced an unnecessary pass boundary");
+      command.EndRendering();
+      Require(name, "attachment store dependency", capture.barriers.size() == 1,
+              "ending rendering did not publish attachment stores for the next "
+              "pass");
+      const auto &barrier = capture.barriers.front();
+      const VkPipelineStageFlags2 stages =
+          depth ? VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                      VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT
+                : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+      Require(name, "attachment stage scopes",
+              (barrier.srcStageMask & stages) == stages &&
+                  (barrier.dstStageMask & stages) == stages,
+              "attachment dependency omitted its framebuffer pipeline stages");
+      Require(name, "attachment access scopes",
+              (barrier.srcAccessMask & static_cast<VkAccessFlags2>(write)) !=
+                      0 &&
+                  (barrier.dstAccessMask &
+                   static_cast<VkAccessFlags2>(read | write)) ==
+                      static_cast<VkAccessFlags2>(read | write),
+              "attachment dependency omitted store/load access");
+      state.depth_stencil_attachment.depth_clear = false;
+      state.color_attachments[0].is_clear = false;
+      command.BeginRendering(state);
+      command.EndRendering();
+      command.EndRendering();
+      Require(name, "separate pass and idle end", capture.barriers.size() == 2,
+              "a real pass end lost its dependency or an idle end added one");
+    }
+    StreamBuffer download(graphics, scheduler, MemoryUsage::Download, 4096);
+    const auto [data, offset] = download.Map(16, 4);
+    download.Commit();
+    vk::BufferImageCopy copy{};
+    copy.bufferOffset = offset;
+    copy.imageSubresource = {aspect, 0, 0, 1};
+    copy.imageExtent = {2, 2, 1};
+    image.Download(std::span{&copy, 1}, download.Handle(), offset, 16);
+    scheduler.Finish();
+    download.Invalidate(offset, 16);
+    const std::array<float, 4> expected{0.25f, 0.25f, 0.25f, 0.25f};
+    Require(name, "clear/store/load content",
+            data != nullptr &&
+                std::memcmp(data, expected.data(), sizeof(expected)) == 0,
+            "a separate load pass lost the preceding clear");
+    graphics.device.destroyImageView(view);
+  }
+  std::printf("[gpu]     %-32s ok\n", name);
+}
+
 void CheckImageTransitionState(RenderContext &renderer) {
+  CheckAttachmentPassDependencies(renderer);
   constexpr const char *name = "ImageTransitionState";
   auto &context = renderer.GetGraphics();
   CommandScheduler scheduler(renderer, context);
@@ -45472,6 +45677,15 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--image-upload-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckLargeSparseImageUpload();
+    return 0;
+  }
+  if (argc == 3 && std::strcmp(argv[1], "--depth-alias-death") == 0) {
+    Require("DepthAlias", "case",
+            std::strcmp(argv[2], "cross-format") == 0 ||
+                std::strcmp(argv[2], "unequal-samples") == 0,
+            "unknown death test case");
+    VulkanHarness vulkan;
+    vulkan.CheckUnifiedTextureCacheFlow(argv[2]);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--image-overlap-only") == 0) {

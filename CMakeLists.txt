@@ -674,6 +674,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
 	add_test(NAME image_transfer_layout
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-layout-only)
+	add_test(NAME image_transition_state
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-transition-only)
 
 	add_test(NAME texture_cache_layered_image
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --layered-image-only)
@@ -694,6 +696,13 @@ if(BUILD_TESTING)
 
 	add_test(NAME texture_cache_image_overlap
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --image-overlap-only)
+	foreach(alias_case cross-format unequal-samples)
+		add_test(NAME texture_cache_depth_alias_${alias_case}
+			COMMAND ${CMAKE_COMMAND}
+				-DTEST_EXECUTABLE=$<TARGET_FILE:shader_recompiler_compute_tests>
+				-DALIAS_CASE=${alias_case}
+				-P ${CMAKE_CURRENT_SOURCE_DIR}/tests/DepthAliasDeath.cmake)
+	endforeach()
 	add_test(NAME texture_cache_htile_clear
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --htile-clear-only)
 	add_test(NAME buffer_cache_ranges

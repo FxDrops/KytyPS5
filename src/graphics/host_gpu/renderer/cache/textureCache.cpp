@@ -686,7 +686,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
 	    (cached.info.metadata.kind == ImageMetadataKind::None ||
 	     cached.info.metadata.kind == ImageMetadataKind::Htile);
-	bool recreate = cached.info.resources < requested.resources ||
+	bool recreate = cached.info.resources.levels < requested.resources.levels ||
+	                cached.info.resources.layers < requested.resources.layers ||
 	                requested.IsVolume() != cached.info.IsVolume();
 	switch (binding) {
 		case BindingType::Texture:
@@ -704,11 +705,28 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	if (!recreate) {
 		return cached_id;
 	}
+	// Reject unsupported conversions before refreshing or replacing the owner.
+	// Image construction preserves the requested native format and sample count.
+	if (cached.backing.samples == requested.samples) {
+		const bool copy_supported =
+		    cached.backing.samples == 1 || cached.backing.format == requested.pixel_format ||
+		    (!cached.info.IsDepth() && !requested.IsDepth() &&
+			 ImageViewOps::FormatsCompatible(cached.backing.format, requested.pixel_format));
+		if (!copy_supported) {
+			EXIT("TextureCache: unsupported cross-format multisample depth copy "
+			     "(format=%u -> %u, samples=%u)\n",
+			     static_cast<uint32_t>(cached.backing.format),
+			     static_cast<uint32_t>(requested.pixel_format), requested.samples);
+		}
+	} else if (!(cached.backing.samples == 1 && requested.samples > 1 && requested.IsDepth())) {
+		EXIT("TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
+		     cached.backing.samples, requested.samples);
+	}
 	RefreshImage(cached_id);
 	auto info = requested;
 	if (retain_cached_layout) {
-		info.data       = cached.info.data;
-		info.resources  = cached.info.resources;
+		info.data                = cached.info.data;
+		info.resources           = cached.info.resources;
 		info.mip_layout          = cached.info.mip_layout;
 		info.tiling              = cached.info.tiling;
 		info.tiled_slice_stride  = cached.info.tiled_slice_stride;
@@ -723,18 +741,8 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		cached.binding.needs_rebind = true;
 	}
 	if (cached.backing.samples == replacement.backing.samples) {
-		const bool copy_supported =
-		    cached.backing.samples == 1 || cached.backing.format == replacement.backing.format ||
-		    (!cached.info.IsDepth() && !replacement.info.IsDepth() &&
-		     ImageViewOps::FormatsCompatible(cached.backing.format, replacement.backing.format));
-		if (copy_supported) {
-			CopyImage(replacement_id, cached_id);
-		} else {
-			LOGF_COLOR(Log::Color::BrightYellow,
-			           "TextureCache: unsupported cross-format multisample depth copy\n");
-		}
-	} else if (cached.backing.samples == 1 && replacement.backing.samples > 1 &&
-	           replacement.info.IsDepth()) {
+		CopyImage(replacement_id, cached_id);
+	} else {
 		RefreshCopySource(cached_id);
 		if (cached.IsBufferModified() || cached.IsDefinitelyCpuDirty()) {
 			EXIT("TextureCache: multisample depth conversion source is not native-current\n");
@@ -742,10 +750,6 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		PrepareImageCopy(replacement);
 		m_blit_helper.ReinterpretColorAsMsDepth(cached, replacement);
 		CommitGpuWrite(replacement);
-	} else {
-		LOGF_COLOR(Log::Color::BrightYellow,
-		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
-		           cached.backing.samples, replacement.backing.samples);
 	}
 	FreeImage(cached_id);
 	return replacement_id;
