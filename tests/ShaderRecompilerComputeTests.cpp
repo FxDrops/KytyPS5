@@ -8590,6 +8590,54 @@ public:
                   std::vector<u32>{exact_gpu_value},
               "exact-format recreation initialized from "
               "stale guest bytes");
+      {
+        constexpr uint32_t alias_rewrite = std::bit_cast<uint32_t>(0.875f);
+        auto signed_desc = exact_buffer_desc;
+        signed_desc.info.pixel_format = vk::Format::eR32Sint;
+        signed_desc.info.guest_format = Prospero::BufferFormat::k32SInt;
+        signed_desc.view_info.format = vk::Format::eR32Sint;
+        const auto signed_alias = texture_cache.FindImage(signed_desc, true);
+        (void)texture_cache.FindTexture(signed_alias, signed_desc);
+        auto &writer = texture_cache.GetImage(exact_float_image);
+        writer.Transit(vk::ImageLayout::eTransferDstOptimal,
+                       vk::AccessFlagBits2::eTransferWrite, {},
+                       command.Handle());
+        vk::ClearColorValue rewrite_clear{};
+        rewrite_clear.float32[0] = 0.875f;
+        command.Handle().clearColorImage(writer.backing.image,
+                                         vk::ImageLayout::eTransferDstOptimal,
+                                         &rewrite_clear, 1, &exact_range);
+        texture_cache.MarkGpuWritten(exact_float_image);
+        auto reuse_desc = exact_buffer_desc;
+        const auto reused = texture_cache.FindImage(reuse_desc, true);
+        Require(name, "existing exact alias reuse",
+                reused == exact_buffer_image,
+                "existing exact-format alias was unnecessarily replaced");
+        for (const auto read_alias : {reused, signed_alias}) {
+          (void)texture_cache.FindTexture(
+              read_alias, read_alias == reused ? reuse_desc : signed_desc);
+          auto &reader = texture_cache.GetImage(read_alias);
+          auto reuse_readback = CreateHostBuffer(
+              name, sizeof(alias_rewrite),
+              vk::BufferUsageFlagBits::eTransferDst, std::vector<u32>{0});
+          reader.Transit(vk::ImageLayout::eTransferSrcOptimal,
+                         vk::AccessFlagBits2::eTransferRead, {},
+                         command.Handle());
+          command.Handle().copyImageToBuffer(
+              reader.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+              reuse_readback.buffer, 1, &exact_float_copy);
+          HostReadBarrier(reuse_readback.buffer, reuse_readback.size,
+                          vk::PipelineStageFlagBits::eTransfer,
+                          vk::AccessFlagBits::eTransferWrite);
+          scheduler.Finish();
+          Require(
+              name, "existing exact alias fresh contents",
+              ReadBuffer(name, reuse_readback, 1) ==
+                  std::vector<u32>{alias_rewrite},
+              "existing format alias read a stale buffer after native writes");
+          DestroyBuffer(&reuse_readback);
+        }
+      }
       Require(name, "partial-page CPU refresh content",
               ReadBuffer(name, partial_cpu_refresh_readback,
                          partial_cpu_refresh_expected.size()) ==

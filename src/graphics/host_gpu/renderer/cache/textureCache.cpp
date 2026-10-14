@@ -1175,6 +1175,38 @@ void TextureCache::RefreshImage(ImageId id) {
 	if (image.IsMaybeCpuDirty()) {
 		(void)image.ResolveMaybeCpuHash(image.HashGuestEdges());
 	}
+	if (!image.depth_id && !image.info.HasStencil() && !image.info.HasMetadata()) {
+		ImageIds aliases;
+		ImageId  writer {};
+		for (const auto candidate:
+		     FindImagesInRegion(image.info.data.address, image.info.data.size, false)) {
+			auto& alias = m_slot_images[candidate];
+			if (candidate == id || alias.depth_id || alias.info.HasStencil() ||
+			    alias.info.HasMetadata() || alias.info.pitch != image.info.pitch ||
+			    alias.info.mip_layout != image.info.mip_layout ||
+			    !SameBacking(alias.info, image.info, false) ||
+			    !SameBacking(image.info, alias.info, false)) {
+				continue;
+			}
+			aliases.push_back(candidate);
+			if (alias.SafeToDownload()) {
+				if (writer || image.SafeToDownload()) {
+					EXIT("TextureCache: conflicting native writers for equal-layout aliases\n");
+				}
+				writer = candidate;
+			}
+		}
+		if (writer) {
+			if (!PublishImageToBuffer(m_slot_images[writer])) {
+				EXIT("TextureCache: cannot publish existing format alias contents\n");
+			}
+			// All matching native copies must reload, even aliases not used by this draw.
+			image.MarkBufferModified();
+			for (const auto alias: aliases) {
+				m_slot_images[alias].MarkBufferModified();
+			}
+		}
+	}
 	bool cpu_dirty = image.IsBufferModified() || image.IsDefinitelyCpuDirty();
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		if (cpu_dirty) {
@@ -1412,9 +1444,6 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
 		}
 	}
-	if (desc.type == BindingType::Storage) {
-		image.MarkGpuModified();
-	}
 	if (!image.info.data.Empty()) {
 		RefreshImage(id);
 		if (image.info.HasStencil() &&
@@ -1434,6 +1463,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 	switch (desc.type) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
+			image.MarkGpuModified();
 			if (!image.info.data.Empty()) {
 				CommitGpuWrite(image);
 			}
@@ -1454,7 +1484,6 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
 	}
 	TouchImage(image);
-	image.MarkGpuModified();
 	image.usage.render_target = true;
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -1472,7 +1501,6 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
 	}
 	TouchImage(image);
-	image.MarkGpuModified();
 	if (desc.info.HasStencil()) {
 		const auto layers = image.info.resources.layers;
 		EXIT_IF(layers == 0 || image.info.data.size % layers != 0 ||
