@@ -838,8 +838,18 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	}
 	auto&      cached       = *owner;
 	const auto current_tick = m_scheduler.CurrentTick();
-	const bool safe_to_delete =
+	const bool old_enough_to_retire =
 	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval;
+	const auto retire_overlap = [&] {
+		if (cached.IsMaybeCpuDirty()) {
+			(void)cached.ResolveMaybeCpuHash(cached.HashGuestEdges());
+		}
+		// Age permits eviction, but does not make native GPU writes disposable.
+		if (cached.SafeToDownload() && !PublishImageToBuffer(cached)) {
+			EXIT("TextureCache: cannot publish aged overlap contents before retirement\n");
+		}
+		FreeImage(cached_id);
+	};
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
@@ -889,8 +899,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			                        left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
 			                        left.surface_z == right.surface_z;
 		                 }))) {
-			if (safe_to_delete) {
-				FreeImage(cached_id);
+			if (old_enough_to_retire) {
+				retire_overlap();
 			}
 			return {merged_id};
 		}
@@ -974,8 +984,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		FreeImage(cached_id);
 		return {merged_id};
 	}
-	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
-		FreeImage(cached_id);
+	if (requested.data.address >= cached.info.data.address && old_enough_to_retire) {
+		retire_overlap();
 	}
 	return {merged_id};
 }

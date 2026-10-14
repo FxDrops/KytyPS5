@@ -9862,6 +9862,63 @@ public:
                   !boundary_buffer_cache.HasGpuDirtyBytes(final_word_address, sizeof(uint32_t)),
               "a final-byte CPU read did not publish the GPU-owned final word");
 
+      for (const bool maybe_cpu_dirty : {false, true}) {
+        const uint64_t aged_offset = 0x2b00000 + (maybe_cpu_dirty ? 0x1000 : 0);
+        constexpr uint32_t aged_value = 0x7a3512cdu;
+        std::memset(memory + aged_offset, 0, 64);
+        auto aged_desc =
+            MakeLinearDesc(base + aged_offset, 64, vk::Format::eR32Uint,
+                           Prospero::BufferFormat::k32UInt,
+                           Prospero::ImageType::kColor2D, {4, 4, 1}, 1, 4, 1);
+        const auto aged_id = texture_cache.FindImage(aged_desc);
+        (void)texture_cache.FindTexture(aged_id, aged_desc);
+        auto &aged_native = texture_cache.GetImage(aged_id);
+        aged_native.Transit(vk::ImageLayout::eTransferDstOptimal,
+                            vk::AccessFlagBits2::eTransferWrite, {},
+                            command.Handle());
+        vk::ClearColorValue aged_clear{};
+        aged_clear.uint32[0] = aged_value;
+        const vk::ImageSubresourceRange aged_range{
+            vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+        command.Handle().clearColorImage(aged_native.backing.image,
+                                         vk::ImageLayout::eTransferDstOptimal,
+                                         &aged_clear, 1, &aged_range);
+        texture_cache.MarkGpuWritten(aged_id);
+        while (scheduler.CurrentTick() <= 33) {
+          scheduler.Finish();
+        }
+        aged_native.tick_accessed_last = 0;
+        if (maybe_cpu_dirty) {
+          aged_native.MarkMaybeCpuDirty();
+        }
+        auto interior_desc =
+            MakeLinearDesc(base + aged_offset + 4, 16, vk::Format::eR32Uint,
+                           Prospero::BufferFormat::k32UInt,
+                           Prospero::ImageType::kColor2D, {2, 2, 1}, 1, 4, 1);
+        const auto interior_id = texture_cache.FindImage(interior_desc);
+        Require(name, "aged overlap retirement",
+                !TextureCacheTestAccess::Contains(texture_cache, aged_id),
+                "aged incompatible overlap was not retired");
+        (void)texture_cache.FindTexture(interior_id, interior_desc);
+        auto &interior = texture_cache.GetImage(interior_id);
+        auto aged_readback =
+            CreateHostBuffer(name, 16, vk::BufferUsageFlagBits::eTransferDst,
+                             std::vector<u32>(4));
+        vk::BufferImageCopy aged_copy{};
+        aged_copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+        aged_copy.imageExtent = {2, 2, 1};
+        interior.Download(std::span{&aged_copy, 1}, aged_readback.buffer, 0,
+                          16);
+        HostReadBarrier(aged_readback.buffer, aged_readback.size,
+                        vk::PipelineStageFlagBits::eTransfer,
+                        vk::AccessFlagBits::eTransferWrite);
+        scheduler.Finish();
+        Require(name, "aged overlap GPU contents",
+                ReadBuffer(name, aged_readback, 4) ==
+                    std::vector<u32>(4, aged_value),
+                "retiring an aged overlap discarded authoritative GPU bytes");
+        DestroyBuffer(&aged_readback);
+      }
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
       LibKernel::Memory::InstallGpuResources(nullptr);
